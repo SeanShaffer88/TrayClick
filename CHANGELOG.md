@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — 2026-10-24
+
+Five additions, all from SEAN's suggestion round:
+
+- **New: corner failsafe.** While clicking is on, slamming the mouse into the top-left corner of the screen stops clicking immediately. At a 1 ms interval the clicker can do damage fast if the pointer lands somewhere bad; this is the fastest possible stop, no keybind hunt required.
+- **New: Start with Windows.** A checkable sixth menu item toggles the per-user Run-key entry (no admin). With the portable exe the entry points at the exe's current location — move the exe, toggle it once, done.
+- **New: choose which mouse button clicks.** Left, right, or middle, chosen in the Set Interval window (which keeps its name and its menu slot), saved in the config like everything else.
+- **New: click counter.** The tooltip while clicking reads "TrayClick — clicking ON · N clicks", and Credits shows the session total.
+- **New: interval jitter.** An optional toggle in the Set Interval window varies each interval by up to ±10%, so the cadence isn't metronome-perfect. Off by default.
+
+The tray menu is now exactly six items (this amends the five-item rule at SEAN's direction). Config files from every earlier version load unchanged — the new fields default to left button, jitter off.
+
 ## 0.3.1 — 2026-10-24
 
 - **Polish:** the OEM punctuation keys now show by name in the menu and Credits instead of a hex code — `\` (which showed as "Key 0xDC"), `/`, `;`, `'`, `[`, `]`, `,`, `.`, `-`, `=`, and `` ` ``. Prompted by a field screenshot: SEAN's own keybind is the `\` key, and the menu called it "Key 0xDC".
