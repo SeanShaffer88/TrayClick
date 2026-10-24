@@ -14,4 +14,5 @@ Project invariants — do not change without SEAN's direction:
 - The keypress that assigns a new keybind must never start clicking (the press detector resyncs when the capture window closes); clicking starts only on the next fresh press.
 - Core state machine and config logic live in `src/lib.rs` (platform-independent, unit-tested). `src/main.rs` is Win32 only.
 - The corner failsafe (stop clicking when the cursor enters the top-left corner zone while clicking) and the click counter (tooltip + Credits) are directed 0.4.0 features; do not remove them as "extras". Start with Windows uses the HKCU Run key only — never HKLM, never a scheduled task.
+- Directed 0.5.0 features, same standing: Hold mode (every stop path must release the held button — the release funnels through `refresh_indicator` → `sync_hold_state`), Locked target (clicks go to the point captured at activation, cursor restored after each click), the per-run auto-stop limit, and start-on-launch (click mode only, defaults off).
 - Gate before publishing: `cargo fmt --all`, `cargo clippy --all-targets`, full `cargo test`, and a Windows-target check/build.
