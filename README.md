@@ -38,7 +38,15 @@ While clicking is on, clicking follows your cursor — it clicks wherever the po
 
 ## Screenshots
 
-Captures from a real run will go here. See [docs/screenshots/CAPTURE.md](docs/screenshots/CAPTURE.md) for the exact shots needed.
+The tray menu — all five items, with the current keybind and interval shown in brackets:
+
+![TrayClick tray menu](docs/screenshots/tray-menu.png)
+
+The Set Interval window — 1 ms and 100 ms presets, or type any custom value and click Apply:
+
+![TrayClick Set Interval window](docs/screenshots/set-interval.png)
+
+More captures from a real run are on the way; see [docs/screenshots/CAPTURE.md](docs/screenshots/CAPTURE.md) for the exact shots still needed.
 
 ## Build from source
 
