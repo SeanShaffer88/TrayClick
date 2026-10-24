@@ -33,8 +33,8 @@
 //! cursor position at the configured interval (default 100 ms),
 //! indefinitely, until the keybind is pressed again. While clicking is
 //! on, the tray icon blinks (alternating with an inverted red icon every
-//! 500 ms) and its tooltip reads "TrayClick — clicking ON", so the state
-//! is visible at a glance.
+//! 500 ms) and its tooltip shows the running click count (or, in hold
+//! mode, which button is held), so the state is visible at a glance.
 //!
 //! All state-machine logic lives in the platform-independent library
 //! (`lib.rs`) and is unit-tested there; this file is the Win32 shell.
@@ -438,13 +438,28 @@ mod win {
         Duration::from_millis(ms as u64)
     }
 
+    /// The virtual screen's top-left corner, read once. The failsafe
+    /// check runs in the clicker's hot loops, and the origin only moves
+    /// when a monitor is added or removed — in that rare mid-run case
+    /// the corner follows the layout as it was when first read, until
+    /// TrayClick restarts. (The check failing safe — stopping — is the
+    /// worst outcome of a stale origin.)
+    fn failsafe_origin() -> (i32, i32) {
+        static ORIGIN: OnceLock<(i32, i32)> = OnceLock::new();
+        *ORIGIN.get_or_init(|| unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            )
+        })
+    }
+
     /// True when the cursor is in the top-left corner failsafe zone.
     fn cursor_in_failsafe() -> bool {
         unsafe {
             let mut pt = POINT::default();
             if GetCursorPos(&mut pt).is_ok() {
-                let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                let (vx, vy) = failsafe_origin();
                 return in_failsafe_corner(pt.x, pt.y, vx, vy);
             }
             false
@@ -466,14 +481,24 @@ mod win {
     /// that overshoot would collapse the click rate. The spin runs only
     /// while clicking, and only for the last slice of each interval.
     fn wait_until(deadline: Instant) {
+        // The failsafe check costs a `GetCursorPos` per call — cheap in
+        // the sleep phase (iterations are milliseconds apart) but pure
+        // overhead in the spin tail, which can loop thousands of times
+        // in the last 2 ms. Throttle it to every 500 µs there: a mouse
+        // slam takes far longer than that to reach the corner, so stop
+        // latency is unchanged in practice.
+        let mut last_failsafe_check = Instant::now() - Duration::from_millis(1);
         loop {
             let now = Instant::now();
             if now >= deadline || !lock_engine().is_clicking_now() {
                 return;
             }
-            if cursor_in_failsafe() {
-                trip_failsafe();
-                return;
+            if now.duration_since(last_failsafe_check) >= Duration::from_micros(500) {
+                last_failsafe_check = now;
+                if cursor_in_failsafe() {
+                    trip_failsafe();
+                    return;
+                }
             }
             let remaining = deadline - now;
             if remaining > Duration::from_millis(2) {
@@ -556,13 +581,7 @@ mod win {
             let vk = KEYBIND_VK.load(Ordering::SeqCst) as i32;
             let down = unsafe { GetAsyncKeyState(vk) } & (0x8000u16 as i16) != 0;
             if detector.sample(down) {
-                let raw = MAIN_HWND.load(Ordering::SeqCst);
-                if raw != 0 {
-                    let hwnd = HWND(raw as isize as *mut c_void);
-                    unsafe {
-                        let _ = PostMessageW(Some(hwnd), WM_APP_TOGGLE, WPARAM(0), LPARAM(0));
-                    }
-                }
+                post_main(WM_APP_TOGGLE);
             }
         }
     }
