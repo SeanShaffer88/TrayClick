@@ -59,6 +59,62 @@ impl ClickButton {
     }
 }
 
+/// What the keybind does while active: repeated clicks, or holding
+/// the button down until the keybind is pressed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClickMode {
+    #[default]
+    Click,
+    Hold,
+}
+
+impl ClickMode {
+    /// The config-file spelling of this mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClickMode::Click => "click",
+            ClickMode::Hold => "hold",
+        }
+    }
+
+    /// Parse a config-file spelling; `None` for anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "click" => Some(ClickMode::Click),
+            "hold" => Some(ClickMode::Hold),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name for menus and dialogs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClickMode::Click => "Click",
+            ClickMode::Hold => "Hold",
+        }
+    }
+}
+
+/// The largest auto-stop limit (in clicks) the config accepts.
+pub const MAX_LIMIT_CLICKS: u32 = 100_000_000;
+
+/// Whether an auto-stop limit is acceptable: 0 means "no limit".
+pub fn is_valid_limit(n: u32) -> bool {
+    n <= MAX_LIMIT_CLICKS
+}
+
+/// Map a point on an axis to the 0..=65535 absolute coordinate that
+/// `SendInput` expects for that axis of the virtual screen, given the
+/// axis `origin` (which may be negative) and `extent` in pixels.
+/// Out-of-range points clamp to the nearest edge.
+pub fn absolute_coord(pos: i32, origin: i32, extent: i32) -> u16 {
+    if extent <= 1 {
+        return 0;
+    }
+    let scaled = (pos as i64 - origin as i64) * 65535 / (extent as i64 - 1);
+    scaled.clamp(0, 65535) as u16
+}
+
 /// Apply up to ±10% jitter to an interval, using `rand` as the random
 /// source (any u32; only its value mod 201 is used, mapping to a
 /// per-mille factor of 900..=1100). A 1 ms interval is returned
@@ -314,13 +370,20 @@ pub fn key_name(vk: u32) -> String {
 }
 
 /// Persisted settings: the keybind, the click interval, which mouse
-/// button is clicked, and whether interval jitter is on.
+/// button is clicked, whether interval jitter is on, the mode (click
+/// or hold), whether clicks lock to the position where clicking
+/// started, the auto-stop limit in clicks (0 = no limit), and whether
+/// clicking starts when TrayClick launches (click mode only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     pub keybind_vk: u32,
     pub interval_ms: u32,
     pub button: ClickButton,
     pub jitter: bool,
+    pub mode: ClickMode,
+    pub lock_position: bool,
+    pub limit_clicks: u32,
+    pub start_on_launch: bool,
 }
 
 impl Default for Config {
@@ -330,6 +393,10 @@ impl Default for Config {
             interval_ms: DEFAULT_INTERVAL_MS,
             button: ClickButton::Left,
             jitter: false,
+            mode: ClickMode::Click,
+            lock_position: false,
+            limit_clicks: 0,
+            start_on_launch: false,
         }
     }
 }
@@ -374,11 +441,15 @@ impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {}\n}}\n",
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {}\n}}\n",
             self.keybind_vk,
             self.interval_ms,
             self.button.as_str(),
-            self.jitter
+            self.jitter,
+            self.mode.as_str(),
+            self.lock_position,
+            self.limit_clicks,
+            self.start_on_launch
         )
     }
 
@@ -416,12 +487,47 @@ impl Config {
                 false
             }
         };
+        // Fields added in 0.5.0; absent in older files, defaults apply.
+        let mode = match json_str(text, "\"mode\"") {
+            Some(name) => ClickMode::from_name(&name)?,
+            None => ClickMode::Click,
+        };
+        let lock_position = opt_bool(text, "\"lock_position\"")?;
+        let limit_clicks = match json_u32(text, "\"limit_clicks\"") {
+            Some(n) => {
+                if !is_valid_limit(n) {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let start_on_launch = opt_bool(text, "\"start_on_launch\"")?;
         Some(Self {
             keybind_vk: vk,
             interval_ms,
             button,
             jitter,
+            mode,
+            lock_position,
+            limit_clicks,
+            start_on_launch,
         })
+    }
+}
+
+/// Read an optional boolean field: absent → `Some(false)`, present
+/// and valid → its value, present but garbled → `None`.
+fn opt_bool(text: &str, key: &str) -> Option<bool> {
+    match json_bool(text, key) {
+        Some(b) => Some(b),
+        None => {
+            if text.contains(key) {
+                None
+            } else {
+                Some(false)
+            }
+        }
     }
 }
 
@@ -510,9 +616,68 @@ mod tests {
             interval_ms: 250,
             button: ClickButton::Right,
             jitter: true,
+            mode: ClickMode::Hold,
+            lock_position: true,
+            limit_clicks: 5_000,
+            start_on_launch: true,
         };
         let json = cfg.to_json();
         assert_eq!(Config::from_json(&json), Some(cfg));
+    }
+
+    #[test]
+    fn config_from_040_gets_mode_defaults() {
+        // A v0.4.x config file has none of the 0.5.0 fields.
+        let cfg = Config::from_json(
+            "{\"keybind_vk\": 117, \"interval_ms\": 50, \"button\": \"middle\", \"jitter\": true}",
+        )
+        .unwrap();
+        assert_eq!(cfg.mode, ClickMode::Click);
+        assert!(!cfg.lock_position);
+        assert_eq!(cfg.limit_clicks, 0);
+        assert!(!cfg.start_on_launch);
+    }
+
+    #[test]
+    fn config_rejects_bad_mode_and_limit() {
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"mode\": \"smash\"}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"limit_clicks\": 100000001}"),
+            None
+        );
+        assert!(is_valid_limit(0));
+        assert!(is_valid_limit(MAX_LIMIT_CLICKS));
+        assert!(!is_valid_limit(MAX_LIMIT_CLICKS + 1));
+    }
+
+    #[test]
+    fn mode_names_round_trip() {
+        for m in [ClickMode::Click, ClickMode::Hold] {
+            assert_eq!(ClickMode::from_name(m.as_str()), Some(m));
+        }
+        assert_eq!(ClickMode::from_name("Click"), None);
+        assert_eq!(ClickMode::default(), ClickMode::Click);
+    }
+
+    #[test]
+    fn absolute_coord_maps_virtual_screen() {
+        // Single 1920-wide screen starting at 0.
+        assert_eq!(absolute_coord(0, 0, 1920), 0);
+        assert_eq!(absolute_coord(1919, 0, 1920), 65535);
+        let mid = absolute_coord(960, 0, 1920);
+        assert!((32700..=32900).contains(&mid), "mid was {mid}");
+        // A second monitor to the left: origin -1920, extent 3840.
+        assert_eq!(absolute_coord(-1920, -1920, 3840), 0);
+        assert_eq!(absolute_coord(1919, -1920, 3840), 65535);
+        // Out-of-range clamps instead of wrapping.
+        assert_eq!(absolute_coord(99999, 0, 1920), 65535);
+        assert_eq!(absolute_coord(-99999, 0, 1920), 0);
+        // Degenerate extents are safe.
+        assert_eq!(absolute_coord(5, 0, 1), 0);
+        assert_eq!(absolute_coord(5, 0, 0), 0);
     }
 
     #[test]
