@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 — 2026-10-24
+
+Internal review and optimization pass (the second senior review, after 0.2.2). No features added or removed, and no intended behaviour changes:
+
+- **Cheaper failsafe watching.** The click wait loop checked the cursor position on every spin iteration — thousands of redundant `GetCursorPos` calls in the final 2 ms of each interval. The check is now throttled to every 500 µs in that phase (a mouse slam takes far longer to reach the corner, so stop latency is unchanged in practice), and the virtual-screen origin is read once instead of on every check. One nuance: if you hot-plug a monitor mid-run, the failsafe corner follows the layout as it was when first read until TrayClick restarts.
+- **Deduplicated internals.** The keybind thread now posts through the same helper as the other worker threads, and the config parser's three optional booleans share one code path (with a new test pinning that a garbled one still rejects the file).
+- **Refreshed stale descriptions** (the crate description and a module comment still described the 0.1/0.3 feature set).
+
+Everything else the review re-checked came back clean and is unchanged: the hold-release funnel, the atomic config save, the icon/brush handle lifetimes, and the size-tuned release profile.
+
 ## 0.5.0 — 2026-10-24
 
 Four more additions, SEAN's second suggestion round:
