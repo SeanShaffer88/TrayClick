@@ -1,8 +1,10 @@
 //! TrayClick core logic: the click engine state machine, the keybind
-//! model, and config persistence formatting.
+//! model, click scheduling, and config persistence formatting.
 //!
 //! This module is platform-independent so it can be unit-tested anywhere.
 //! All Win32 code lives in `main.rs`.
+
+use std::time::{Duration, Instant};
 
 /// Default click interval: the mouse clicks every 100 ms while on.
 pub const DEFAULT_INTERVAL_MS: u32 = 100;
@@ -16,6 +18,24 @@ pub const MAX_INTERVAL_MS: u32 = 60_000;
 /// True if `ms` may be used as the click interval.
 pub fn is_valid_interval(ms: u32) -> bool {
     (MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&ms)
+}
+
+/// Compute the deadline for the click after `previous`, on a fixed
+/// cadence of one click every `interval`.
+///
+/// Scheduling from the previous deadline (instead of sleeping
+/// `interval` after each click) keeps the long-run rate exact: the time
+/// a click itself takes no longer accumulates as drift. If the schedule
+/// has already fallen a full interval or more behind `now` — the PC
+/// slept, or the process was stalled — the next deadline is rebased to
+/// `now + interval` rather than firing catch-up clicks in a burst.
+pub fn next_click_deadline(previous: Instant, interval: Duration, now: Instant) -> Instant {
+    let next = previous + interval;
+    if next <= now {
+        now + interval
+    } else {
+        next
+    }
 }
 
 /// Default toggle key: F6 (`VK_F6`).
@@ -382,6 +402,42 @@ mod tests {
         assert!(!d.sample(true));
         assert!(!d.sample(false)); // user lets go
         assert!(d.sample(true)); // a fresh press toggles, as expected
+    }
+
+    #[test]
+    fn schedule_advances_one_interval() {
+        let t0 = Instant::now();
+        let iv = Duration::from_millis(100);
+        // Half an interval after the previous click: next is t0 + 100 ms.
+        let next = next_click_deadline(t0, iv, t0 + Duration::from_millis(50));
+        assert_eq!(next, t0 + iv);
+    }
+
+    #[test]
+    fn schedule_does_not_play_catch_up() {
+        let t0 = Instant::now();
+        let iv = Duration::from_millis(100);
+        // The process was stalled for 3.5 intervals (e.g. the PC slept):
+        // the deadline rebases to now + interval — no burst of clicks.
+        let now = t0 + Duration::from_millis(350);
+        assert_eq!(next_click_deadline(t0, iv, now), now + iv);
+        // Landing exactly on a deadline also steps to the next one.
+        let exact = t0 + iv;
+        assert_eq!(next_click_deadline(t0, iv, exact), exact + iv);
+    }
+
+    #[test]
+    fn schedule_chains_without_drift() {
+        let t0 = Instant::now();
+        let iv = Duration::from_millis(100);
+        // Each click happens 3 ms "late" (its own cost); the deadlines
+        // must stay on the 100 ms grid regardless.
+        let mut prev = t0;
+        for k in 1..=10u32 {
+            let now = prev + Duration::from_millis(3);
+            prev = next_click_deadline(prev, iv, now);
+            assert_eq!(prev, t0 + iv * k);
+        }
     }
 
     #[test]
