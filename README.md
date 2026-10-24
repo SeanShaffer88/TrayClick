@@ -8,9 +8,18 @@ A tiny Windows tray auto clicker. TrayClick sits in the notification area with n
 - One small executable, no installer, nothing to configure beyond the keybind and interval
 - The keybind and interval you pick are remembered between runs (`%APPDATA%\TrayClick\config.json`)
 
+## Download
+
+Every [release](https://github.com/SeanShaffer88/TrayClick/releases) provides exactly two files:
+
+- **Installer** — `TrayClick-Setup-v<version>-x64.exe`: per-user install (no admin), Start menu shortcut, uninstaller in Windows Settings. Your settings survive uninstall; they're in `%APPDATA%\TrayClick`.
+- **Portable exe** — `TrayClick-v<version>-portable.exe`: the same program as a single file, no install — just run it.
+
+The builds are unsigned, so Windows SmartScreen may warn on first run: "More info" → "Run anyway".
+
 ## How to use
 
-1. Run `trayclick.exe`. It appears in the system tray (notification area) — you may need the `^` overflow arrow the first time.
+1. Run TrayClick (installed shortcut, or the portable exe). It appears in the system tray (notification area) — you may need the `^` overflow arrow the first time.
 2. Press **F6** to start auto-clicking at the cursor. Press **F6** again to stop.
 3. Click the tray icon (left or right click — both work) for the menu:
    - **Pause** — stops clicking immediately and ignores the keybind. The item becomes **Resume**; resuming does not restart clicking until you press the keybind again.
