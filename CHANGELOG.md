@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — 2026-10-24
+
+Four more additions, SEAN's second suggestion round:
+
+- **New: locked-position clicking.** A new Position toggle in the Set Interval window: Follow (the cursor, as always) or Locked — clicking then stays on the spot where you pressed the keybind. Each click darts to the locked point, clicks, and puts your cursor back where you left it, all in one input batch, so you can keep working elsewhere while it clicks. Ideal for a second monitor.
+- **New: Hold mode.** Mode: Click or Hold. In Hold, the keybind presses the chosen button down and keeps it down until you press the keybind again. Every stop path releases it — Pause, the corner failsafe, opening a settings window, and Exit — so the button can never be left stuck down.
+- **New: auto-stop limit.** "Stop after (clicks, 0 = no limit)" in the settings window: clicking stops by itself after that many clicks in a run (up to 100,000,000). Pairs with Start with Windows and start-on-launch for unattended runs that can't run away.
+- **New: start clicking on launch.** An opt-in toggle: when TrayClick starts, clicking starts with it. Click mode only, off by default.
+
+Config files from every earlier version load unchanged — mode defaults to Click, target to Follow, limit to 0 (none), start-on-launch off.
+
 ## 0.4.0 — 2026-10-24
 
 Five additions, all from SEAN's suggestion round:
