@@ -1,6 +1,6 @@
 [package]
 name = "trayclick"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "A tiny Windows tray auto clicker: one keybind toggles left-clicking at the cursor at a set interval (1 ms, 100 ms, or custom)."
 license = "MIT"
@@ -24,4 +24,13 @@ windows = { version = "0.61", features = [
 winresource = "0.1"
 
 [profile.release]
-opt-level = 3
+# Size-tuned release build (the workload is FFI-bound — SendInput and
+# sleeps — so optimizing for size costs no measurable performance):
+# LTO + one codegen unit for cross-crate optimization, symbols stripped,
+# and panic=abort (there are no reachable panics by design; a window proc
+# must never unwind across the FFI boundary anyway).
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
