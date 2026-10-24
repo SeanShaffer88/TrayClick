@@ -135,6 +135,50 @@ impl KeyPressDetector {
     }
 }
 
+/// Pick the image bytes of the best-matching entry in an `.ico` file.
+///
+/// `desired` is the wanted icon width in pixels (e.g. the system's
+/// small-icon size). The chosen entry is the smallest one at least
+/// `desired` wide, or the largest available when all are smaller — so
+/// the shell never has to upscale a tiny image or shrink the 256 px
+/// one into a tray slot. The returned slice is the entry's image data
+/// (a PNG for our generated icons), in the resource format
+/// `CreateIconFromResourceEx` expects. Returns `None` for malformed
+/// data: wrong header, truncated directory, or an image range outside
+/// the file.
+pub fn ico_image_for_size(data: &[u8], desired: u32) -> Option<&[u8]> {
+    if data.len() < 6 {
+        return None;
+    }
+    let reserved = u16::from_le_bytes([data[0], data[1]]);
+    let kind = u16::from_le_bytes([data[2], data[3]]);
+    let count = u16::from_le_bytes([data[4], data[5]]) as usize;
+    if reserved != 0 || kind != 1 || count == 0 {
+        return None;
+    }
+    let mut best_fit: Option<(u32, &[u8])> = None; // smallest width >= desired
+    let mut largest: Option<(u32, &[u8])> = None; // largest width overall
+    for i in 0..count {
+        let base = 6 + 16 * i;
+        let entry = data.get(base..base + 16)?;
+        // A width byte of 0 means 256.
+        let width = match entry[0] {
+            0 => 256,
+            w => w as u32,
+        };
+        let size = u32::from_le_bytes(entry[8..12].try_into().ok()?) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().ok()?) as usize;
+        let image = data.get(offset..offset.checked_add(size)?)?;
+        if largest.is_none_or(|(w, _)| width > w) {
+            largest = Some((width, image));
+        }
+        if width >= desired && best_fit.is_none_or(|(w, _)| width < w) {
+            best_fit = Some((width, image));
+        }
+    }
+    best_fit.or(largest).map(|(_, image)| image)
+}
+
 /// True if `vk` may be assigned as the keybind.
 ///
 /// Rejects mouse buttons (the clicker itself would retrigger them),
@@ -437,6 +481,64 @@ mod tests {
             let now = prev + Duration::from_millis(3);
             prev = next_click_deadline(prev, iv, now);
             assert_eq!(prev, t0 + iv * k);
+        }
+    }
+
+    /// Build a synthetic multi-entry .ico for the picker tests. Each
+    /// entry is (width byte, image bytes); images are appended in order.
+    fn fake_ico(entries: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // type: icon
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut offset = 6 + 16 * entries.len();
+        let mut blobs = Vec::new();
+        for (w, img) in entries {
+            let mut e = [0u8; 16];
+            e[0] = *w;
+            e[1] = *w;
+            e[8..12].copy_from_slice(&(img.len() as u32).to_le_bytes());
+            e[12..16].copy_from_slice(&(offset as u32).to_le_bytes());
+            offset += img.len();
+            out.extend_from_slice(&e);
+            blobs.extend_from_slice(img);
+        }
+        out.extend_from_slice(&blobs);
+        out
+    }
+
+    #[test]
+    fn ico_picker_chooses_smallest_adequate_entry() {
+        let data = fake_ico(&[(16, b"aa"), (32, b"bbb"), (48, b"cccc"), (0, b"ddddd")]);
+        assert_eq!(ico_image_for_size(&data, 16), Some(&b"aa"[..]));
+        assert_eq!(ico_image_for_size(&data, 20), Some(&b"bbb"[..]));
+        assert_eq!(ico_image_for_size(&data, 48), Some(&b"cccc"[..]));
+        // The width byte 0 entry is 256 px wide.
+        assert_eq!(ico_image_for_size(&data, 100), Some(&b"ddddd"[..]));
+        // Nothing is big enough: fall back to the largest entry.
+        assert_eq!(ico_image_for_size(&data, 512), Some(&b"ddddd"[..]));
+    }
+
+    #[test]
+    fn ico_picker_rejects_malformed_data() {
+        assert_eq!(ico_image_for_size(b"", 16), None);
+        assert_eq!(ico_image_for_size(b"\x00\x00\x02\x00\x01\x00", 16), None); // not type 1
+        let truncated = fake_ico(&[(16, b"aa")]);
+        assert_eq!(ico_image_for_size(&truncated[..10], 16), None); // short directory
+        let mut bad_offset = fake_ico(&[(16, b"aa")]);
+        bad_offset[6 + 12] = 0xFF; // image offset far past the end
+        bad_offset[6 + 13] = 0xFF;
+        assert_eq!(ico_image_for_size(&bad_offset, 16), None);
+    }
+
+    #[test]
+    fn shipped_icons_parse_and_have_png_entries() {
+        for bytes in [
+            include_bytes!("../assets/icon.ico").as_slice(),
+            include_bytes!("../assets/icon_active.ico").as_slice(),
+        ] {
+            let img = ico_image_for_size(bytes, 16).expect("icon entry");
+            assert!(img.starts_with(b"\x89PNG"));
         }
     }
 
