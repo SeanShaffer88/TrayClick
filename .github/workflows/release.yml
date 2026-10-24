@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "TrayClick-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target/release/trayclick.exe $stage/
+          Copy-Item README.md $stage/
+          Copy-Item LICENSE $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+          $lines = @()
+          foreach ($f in @("target/release/trayclick.exe", "$stage.zip")) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            $lines += "$h  $(Split-Path $f -Leaf)"
+          }
+          $lines | Set-Content SHA256SUMS.txt
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/trayclick.exe
+            TrayClick-*.zip
+            SHA256SUMS.txt
