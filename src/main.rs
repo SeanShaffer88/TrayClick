@@ -3,18 +3,23 @@
 //! TrayClick — a Windows tray auto clicker.
 //!
 //! Lives entirely in the notification area. Left- or right-clicking the
-//! tray icon opens a menu with exactly five items:
+//! tray icon opens a menu with exactly six items:
 //!
 //! - **Pause / Resume** — pause stops clicking and ignores the keybind
 //!   until resumed.
 //! - **Set Keybind** — shows the current keybind; opens a small window
-//!   that captures the next key press as the new toggle key. The press
+//!   that captures the next key press as the keybind. The press
 //!   that assigns the key never starts clicking; clicking starts on the
 //!   next fresh press.
 //! - **Set Interval** — shows the current interval; opens a small window
-//!   with 1 ms and 100 ms presets plus a custom value in milliseconds.
+//!   with 1 ms and 100 ms presets plus a custom value in milliseconds,
+//!   the mouse-button choice (left/right/middle), and the jitter toggle.
+//! - **Start with Windows** — checkable; toggles the per-user Run key.
 //! - **Credits** — about/credits dialog.
 //! - **Exit** — removes the tray icon and quits.
+//!
+//! Safety: while clicking, slamming the mouse into the top-left corner
+//! of the screen stops clicking immediately (the corner failsafe).
 //!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
@@ -40,27 +45,34 @@ fn main() {
 mod win {
     use std::ffi::c_void;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        ico_image_for_size, is_valid_interval, is_valid_keybind, key_name, next_click_deadline,
-        Config, Engine, KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        format_count, ico_image_for_size, in_failsafe_corner, is_valid_interval, is_valid_keybind,
+        jittered_interval_ms, key_name, next_click_deadline, ClickButton, Config, Engine,
+        KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{
-        GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+        GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT,
+        WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
         CreateSolidBrush, SetBkMode, SetTextColor, HBRUSH, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE,
+    };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEINPUT,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
     };
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -72,6 +84,9 @@ mod win {
     const WM_TRAYICON: u32 = WM_USER + 1;
     /// Posted by the keybind polling thread on a keybind press edge.
     const WM_APP_TOGGLE: u32 = WM_APP + 1;
+    /// Posted by the click thread when the corner failsafe trips, so the
+    /// UI thread can settle the tray indicator.
+    const WM_APP_FAILSAFE: u32 = WM_APP + 2;
 
     const TRAY_ID: u32 = 1;
 
@@ -82,6 +97,7 @@ mod win {
     const ID_PAUSE_RESUME: usize = 1001;
     const ID_SET_KEYBIND: usize = 1002;
     const ID_SET_INTERVAL: usize = 1003;
+    const ID_START_WITH_WINDOWS: usize = 1006;
     const ID_CREDITS: usize = 1004;
     const ID_EXIT: usize = 1005;
 
@@ -90,10 +106,21 @@ mod win {
     const ID_IV_100MS: usize = 2002;
     const ID_IV_APPLY: usize = 2003;
     const ID_IV_EDIT: usize = 2004;
+    const ID_IV_BTN_LEFT: usize = 2005;
+    const ID_IV_BTN_RIGHT: usize = 2006;
+    const ID_IV_BTN_MIDDLE: usize = 2007;
+    const ID_IV_JITTER: usize = 2008;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
     static INTERVAL_MS: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_INTERVAL_MS);
+    /// Which mouse button is clicked: 0 = left, 1 = right, 2 = middle.
+    static BUTTON: AtomicU32 = AtomicU32::new(0);
+    /// Whether interval jitter (±10%) is on.
+    static JITTER_ON: AtomicBool = AtomicBool::new(false);
+    /// Clicks sent since the process started (shown in the tooltip and
+    /// in Credits).
+    static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
     static MAIN_HWND: AtomicI32 = AtomicI32::new(0);
     /// True while a dialog window (Set Keybind or Set Interval) is open;
     /// the polling thread must not treat keys pressed there as toggles.
@@ -165,11 +192,29 @@ mod win {
         let _ = std::fs::write(&path, cfg.to_json());
     }
 
+    fn button_u32(b: ClickButton) -> u32 {
+        match b {
+            ClickButton::Left => 0,
+            ClickButton::Right => 1,
+            ClickButton::Middle => 2,
+        }
+    }
+
+    fn current_button() -> ClickButton {
+        match BUTTON.load(Ordering::SeqCst) {
+            1 => ClickButton::Right,
+            2 => ClickButton::Middle,
+            _ => ClickButton::Left,
+        }
+    }
+
     /// The live settings as a `Config`, for persisting after a change.
     fn current_config() -> Config {
         Config {
             keybind_vk: KEYBIND_VK.load(Ordering::SeqCst),
             interval_ms: INTERVAL_MS.load(Ordering::SeqCst),
+            button: current_button(),
+            jitter: JITTER_ON.load(Ordering::SeqCst),
         }
     }
 
@@ -180,42 +225,83 @@ mod win {
 
     // ---------- click + keybind worker threads ----------
 
-    fn send_left_click() {
-        let inputs = [
-            INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
-                        mouseData: 0,
-                        dwFlags: MOUSEEVENTF_LEFTDOWN,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
+    fn send_click() {
+        let (down, up): (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) = match current_button() {
+            ClickButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            ClickButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            ClickButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        };
+        let make = |dw_flags: MOUSE_EVENT_FLAGS| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: 0,
+                    dwFlags: dw_flags,
+                    time: 0,
+                    dwExtraInfo: 0,
                 },
             },
-            INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
-                        mouseData: 0,
-                        dwFlags: MOUSEEVENTF_LEFTUP,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            },
-        ];
+        };
+        let inputs = [make(down), make(up)];
         unsafe {
             SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         }
+        CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn interval_dur() -> Duration {
-        Duration::from_millis(INTERVAL_MS.load(Ordering::SeqCst) as u64)
+    /// A tiny xorshift PRNG for interval jitter — good enough to vary
+    /// a cadence; not cryptographic, and nothing here needs it to be.
+    struct XorShift(u32);
+
+    impl XorShift {
+        fn next(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// The interval for the next cycle: the configured value, varied by
+    /// up to ±10% when jitter is on.
+    fn effective_interval(rng: &mut XorShift) -> Duration {
+        let base = INTERVAL_MS.load(Ordering::SeqCst);
+        let ms = if JITTER_ON.load(Ordering::SeqCst) {
+            jittered_interval_ms(base, rng.next())
+        } else {
+            base
+        };
+        Duration::from_millis(ms as u64)
+    }
+
+    /// True when the cursor is in the top-left corner failsafe zone.
+    fn cursor_in_failsafe() -> bool {
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                return in_failsafe_corner(pt.x, pt.y, vx, vy);
+            }
+            false
+        }
+    }
+
+    /// Stop clicking because the failsafe tripped, and tell the UI
+    /// thread so it can settle the tray indicator.
+    fn trip_failsafe() {
+        lock_engine().clicking = false;
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw != 0 {
+            let hwnd = HWND(raw as isize as *mut c_void);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_APP_FAILSAFE, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 
     /// Wait until `deadline`, waking early if clicking stops.
@@ -229,6 +315,10 @@ mod win {
         loop {
             let now = Instant::now();
             if now >= deadline || !lock_engine().is_clicking_now() {
+                return;
+            }
+            if cursor_in_failsafe() {
+                trip_failsafe();
                 return;
             }
             let remaining = deadline - now;
@@ -245,6 +335,12 @@ mod win {
         // Clicks are scheduled on absolute deadlines (see
         // `next_click_deadline`), so the time a click itself takes does
         // not accumulate as drift the way sleep-after-click did.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0x9E37_79B9)
+            | 1;
+        let mut rng = XorShift(seed);
         let mut deadline: Option<Instant> = None;
         loop {
             if !lock_engine().is_clicking_now() {
@@ -252,15 +348,24 @@ mod win {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
+            if cursor_in_failsafe() {
+                trip_failsafe();
+                deadline = None;
+                continue;
+            }
             match deadline {
                 None => {
-                    send_left_click();
-                    deadline = Some(Instant::now() + interval_dur());
+                    send_click();
+                    deadline = Some(Instant::now() + effective_interval(&mut rng));
                 }
                 Some(d) => {
                     if Instant::now() >= d {
-                        send_left_click();
-                        deadline = Some(next_click_deadline(d, interval_dur(), Instant::now()));
+                        send_click();
+                        deadline = Some(next_click_deadline(
+                            d,
+                            effective_interval(&mut rng),
+                            Instant::now(),
+                        ));
                     } else {
                         wait_until(d);
                     }
@@ -380,6 +485,14 @@ mod win {
         }
     }
 
+    /// The tooltip shown while clicking is on, with the session count.
+    fn on_tooltip() -> String {
+        format!(
+            "TrayClick — clicking ON · {} clicks",
+            format_count(CLICK_COUNT.load(Ordering::Relaxed))
+        )
+    }
+
     /// Reflect the engine state in the tray. While clicking is on, the
     /// icon blinks between the normal and active icons (see the
     /// `WM_TIMER` handler) and the tooltip says so; when off, the timer
@@ -388,7 +501,7 @@ mod win {
     fn refresh_indicator(hwnd: HWND) {
         if lock_engine().is_clicking_now() {
             BLINK_NORMAL_SHOWN.store(false, Ordering::SeqCst);
-            tray_modify(hwnd, active_icon(), "TrayClick — clicking ON");
+            tray_modify(hwnd, active_icon(), &on_tooltip());
             unsafe {
                 let _ = SetTimer(Some(hwnd), ID_BLINK_TIMER, BLINK_MS, None);
             }
@@ -398,6 +511,103 @@ mod win {
             }
             BLINK_NORMAL_SHOWN.store(true, Ordering::SeqCst);
             tray_modify(hwnd, app_icon(), "TrayClick");
+        }
+    }
+
+    // ---------- Start with Windows (HKCU Run key) ----------
+
+    /// The Run value this build would write: the quoted current exe path.
+    fn expected_autostart_value() -> String {
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "trayclick.exe".to_string());
+        format!("\"{exe}\"")
+    }
+
+    /// The current Run value for TrayClick, if one is present.
+    fn autostart_value() -> Option<String> {
+        unsafe {
+            let mut hkey = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+                None,
+                KEY_READ,
+                &mut hkey,
+            ) != ERROR_SUCCESS
+            {
+                return None;
+            }
+            let mut ty = REG_VALUE_TYPE::default();
+            let mut size: u32 = 0;
+            let st = RegQueryValueExW(
+                hkey,
+                w!("TrayClick"),
+                None,
+                Some(&mut ty),
+                None,
+                Some(&mut size),
+            );
+            let mut value = None;
+            if st == ERROR_SUCCESS && ty == REG_SZ && size >= 2 {
+                let mut buf = vec![0u8; size as usize];
+                let st2 = RegQueryValueExW(
+                    hkey,
+                    w!("TrayClick"),
+                    None,
+                    None,
+                    Some(buf.as_mut_ptr()),
+                    Some(&mut size),
+                );
+                if st2 == ERROR_SUCCESS {
+                    let units: Vec<u16> = buf
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c))
+                        .collect();
+                    value = Some(
+                        String::from_utf16_lossy(&units)
+                            .trim_end_matches('\0')
+                            .to_string(),
+                    );
+                }
+            }
+            let _ = RegCloseKey(hkey);
+            value
+        }
+    }
+
+    /// True when the Run key already points at this exe.
+    fn autostart_enabled() -> bool {
+        autostart_value().as_deref() == Some(expected_autostart_value().as_str())
+    }
+
+    /// Write or remove the Run value. All failures are silent: the menu
+    /// re-reads the state on every open, so a failed change simply shows
+    /// up unchanged there.
+    fn set_autostart(enable: bool) {
+        unsafe {
+            let mut hkey = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+                None,
+                KEY_SET_VALUE,
+                &mut hkey,
+            ) != ERROR_SUCCESS
+            {
+                return;
+            }
+            if enable {
+                let val = wide(&expected_autostart_value());
+                let bytes: &[u8] =
+                    std::slice::from_raw_parts(val.as_ptr() as *const u8, val.len() * 2);
+                let _ = RegSetValueExW(hkey, w!("TrayClick"), None, REG_SZ, Some(bytes));
+            } else {
+                let _ = RegDeleteValueW(hkey, w!("TrayClick"));
+            }
+            let _ = RegCloseKey(hkey);
         }
     }
 
@@ -430,6 +640,14 @@ mod win {
                 ID_SET_INTERVAL,
                 PCWSTR(interval_w.as_ptr()),
             );
+            let sw_w = wide("Start with Windows");
+            let sw_flags = MF_STRING
+                | if autostart_enabled() {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                };
+            let _ = AppendMenuW(menu, sw_flags, ID_START_WITH_WINDOWS, PCWSTR(sw_w.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, ID_CREDITS, PCWSTR(credits_w.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(exit_w.as_ptr()));
@@ -446,12 +664,24 @@ mod win {
     fn show_credits(hwnd: HWND) {
         let keybind = key_name(KEYBIND_VK.load(Ordering::SeqCst));
         let interval = INTERVAL_MS.load(Ordering::SeqCst);
+        let button = current_button().label();
+        let jitter = if JITTER_ON.load(Ordering::SeqCst) {
+            "on (±10%)"
+        } else {
+            "off"
+        };
+        let clicks = format_count(CLICK_COUNT.load(Ordering::Relaxed));
         let text = wide(&format!(
             "TrayClick {}\r\n\r\n\
              Created by SEAN (SeanShaffer88).\r\n\
              Built with Rust and the Windows API.\r\n\r\n\
-             Keybind: {keybind} — start or stop auto left-clicking at the cursor.\r\n\
-             Interval: {interval} ms (set it from the tray menu).\r\n\r\n\
+             Keybind: {keybind} — start or stop auto clicking at the cursor.\r\n\
+             Interval: {interval} ms (set it from the tray menu).\r\n\
+             Button: {button}\r\n\
+             Jitter: {jitter}\r\n\
+             Clicks this session: {clicks}\r\n\r\n\
+             Safety: while clicking, slam the mouse into the top-left corner\
+             of the screen to stop instantly.\r\n\r\n\
              MIT License — see LICENSE.",
             env!("CARGO_PKG_VERSION")
         ));
@@ -641,6 +871,10 @@ mod win {
                             );
                         }
                     }
+                    ID_IV_BTN_LEFT => apply_button(hwnd, ClickButton::Left),
+                    ID_IV_BTN_RIGHT => apply_button(hwnd, ClickButton::Right),
+                    ID_IV_BTN_MIDDLE => apply_button(hwnd, ClickButton::Middle),
+                    ID_IV_JITTER => apply_jitter(hwnd),
                     // IDCANCEL (2) arrives when Esc is pressed via the
                     // dialog message loop.
                     2 => {
@@ -670,6 +904,64 @@ mod win {
         }
     }
 
+    /// The caption of a mouse-button choice; the current one is ticked.
+    fn button_caption(b: ClickButton, current: ClickButton) -> String {
+        if b == current {
+            format!("✓ {}", b.label())
+        } else {
+            b.label().to_string()
+        }
+    }
+
+    fn jitter_caption() -> &'static str {
+        if JITTER_ON.load(Ordering::SeqCst) {
+            "Jitter: On"
+        } else {
+            "Jitter: Off"
+        }
+    }
+
+    /// Repaint the button-row and jitter captions after a change.
+    fn relabel_interval_controls(hwnd: HWND) {
+        unsafe {
+            for (id, b) in [
+                (ID_IV_BTN_LEFT, ClickButton::Left),
+                (ID_IV_BTN_RIGHT, ClickButton::Right),
+                (ID_IV_BTN_MIDDLE, ClickButton::Middle),
+            ] {
+                if let Ok(btn) = GetDlgItem(Some(hwnd), id as i32) {
+                    let t = wide(&button_caption(b, current_button()));
+                    let _ = SetWindowTextW(btn, PCWSTR(t.as_ptr()));
+                }
+            }
+            if let Ok(jb) = GetDlgItem(Some(hwnd), ID_IV_JITTER as i32) {
+                let t = wide(jitter_caption());
+                let _ = SetWindowTextW(jb, PCWSTR(t.as_ptr()));
+            }
+        }
+    }
+
+    /// Apply a mouse-button choice: persists at once, the window stays
+    /// open (unlike the interval presets, which close it).
+    fn apply_button(hwnd: HWND, b: ClickButton) {
+        BUTTON.store(button_u32(b), Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_jitter(hwnd: HWND) {
+        let on = !JITTER_ON.load(Ordering::SeqCst);
+        JITTER_ON.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
     fn open_interval_window(parent: HWND) {
         if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
             return; // a dialog is already open
@@ -693,7 +985,7 @@ mod win {
                 RegisterClassW(&wc);
             }
             let width = 396;
-            let height = 176;
+            let height = 264;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = match CreateWindowExW(
@@ -794,10 +1086,74 @@ mod win {
             );
             let _ = child(
                 w!("STATIC"),
-                "Presets apply at once. Custom: type a value and click Apply (range 1–60000). Esc cancels.",
+                "Mouse button:",
                 label_style,
                 16,
                 88,
+                360,
+                20,
+                0,
+            );
+            let cur_btn = current_button();
+            let left_cap = button_caption(ClickButton::Left, cur_btn);
+            let _ = child(
+                w!("BUTTON"),
+                &left_cap,
+                btn_style,
+                16,
+                112,
+                80,
+                30,
+                ID_IV_BTN_LEFT,
+            );
+            let right_cap = button_caption(ClickButton::Right, cur_btn);
+            let _ = child(
+                w!("BUTTON"),
+                &right_cap,
+                btn_style,
+                106,
+                112,
+                80,
+                30,
+                ID_IV_BTN_RIGHT,
+            );
+            let middle_cap = button_caption(ClickButton::Middle, cur_btn);
+            let _ = child(
+                w!("BUTTON"),
+                &middle_cap,
+                btn_style,
+                196,
+                112,
+                80,
+                30,
+                ID_IV_BTN_MIDDLE,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                jitter_caption(),
+                btn_style,
+                290,
+                112,
+                74,
+                30,
+                ID_IV_JITTER,
+            );
+            let _ = child(
+                w!("STATIC"),
+                "Button and jitter apply at once. Jitter varies the interval by up to ±10%.",
+                label_style,
+                16,
+                156,
+                360,
+                20,
+                0,
+            );
+            let _ = child(
+                w!("STATIC"),
+                "Presets apply at once. Custom: type a value and click Apply (range 1–60000). Esc cancels.",
+                label_style,
+                16,
+                188,
                 360,
                 36,
                 0,
@@ -823,6 +1179,11 @@ mod win {
             return LRESULT(0);
         }
         match msg {
+            m if m == WM_APP_FAILSAFE => {
+                // The clicker already stopped; just settle the icon.
+                refresh_indicator(hwnd);
+                LRESULT(0)
+            }
             WM_TRAYICON => {
                 let event = lparam.0 as u32;
                 if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
@@ -845,7 +1206,7 @@ mod win {
                     } else {
                         active_icon()
                     };
-                    tray_modify(hwnd, icon, "TrayClick — clicking ON");
+                    tray_modify(hwnd, icon, &on_tooltip());
                 } else {
                     // State changed without a refresh; settle the icon.
                     refresh_indicator(hwnd);
@@ -860,6 +1221,7 @@ mod win {
                     }
                     ID_SET_KEYBIND => open_capture_window(hwnd),
                     ID_SET_INTERVAL => open_interval_window(hwnd),
+                    ID_START_WITH_WINDOWS => set_autostart(!autostart_enabled()),
                     ID_CREDITS => show_credits(hwnd),
                     ID_EXIT => {
                         tray_remove(hwnd);
@@ -906,6 +1268,8 @@ mod win {
         let cfg = load_config();
         KEYBIND_VK.store(cfg.keybind_vk, Ordering::SeqCst);
         INTERVAL_MS.store(cfg.interval_ms, Ordering::SeqCst);
+        BUTTON.store(button_u32(cfg.button), Ordering::SeqCst);
+        JITTER_ON.store(cfg.jitter, Ordering::SeqCst);
 
         std::thread::spawn(clicker_thread);
         std::thread::spawn(keybind_thread);
