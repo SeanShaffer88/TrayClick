@@ -1,6 +1,6 @@
 [package]
 name = "trayclick"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "A tiny Windows tray auto clicker: one keybind toggles left-clicking at the cursor at a set interval (1 ms, 100 ms, or custom)."
 license = "MIT"
