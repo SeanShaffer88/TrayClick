@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-10-24
+
+- **New menu item: Set Interval [100 ms]** — opens a small window with **1 ms** and **100 ms** preset buttons plus a custom value in milliseconds (1–60000). The interval is remembered between runs (`interval_ms` in the config file; v0.1.x config files without it default to 100 ms).
+- **Fix:** the keypress that assigns a new keybind no longer starts clicking. The press detector resyncs when the Set Keybind window closes, so clicking starts only on the next fresh press of the new keybind.
+- Credits dialog now shows the live keybind and interval and takes its version from the package version.
+
 ## 0.1.0 — 2026-10-24
 
 Initial version.
