@@ -20,6 +20,81 @@ pub fn is_valid_interval(ms: u32) -> bool {
     (MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&ms)
 }
 
+/// Which mouse button the clicker sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClickButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+impl ClickButton {
+    /// The config-file spelling of this button.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClickButton::Left => "left",
+            ClickButton::Right => "right",
+            ClickButton::Middle => "middle",
+        }
+    }
+
+    /// Parse a config-file spelling; `None` for anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "left" => Some(ClickButton::Left),
+            "right" => Some(ClickButton::Right),
+            "middle" => Some(ClickButton::Middle),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name for menus and dialogs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClickButton::Left => "Left",
+            ClickButton::Right => "Right",
+            ClickButton::Middle => "Middle",
+        }
+    }
+}
+
+/// Apply up to ±10% jitter to an interval, using `rand` as the random
+/// source (any u32; only its value mod 201 is used, mapping to a
+/// per-mille factor of 900..=1100). A 1 ms interval is returned
+/// unchanged — there is no room below it.
+pub fn jittered_interval_ms(base_ms: u32, rand: u32) -> u32 {
+    if base_ms <= MIN_INTERVAL_MS {
+        return base_ms;
+    }
+    let factor = 900 + (rand % 201) as u64; // per-mille: 0.900 ..= 1.100
+    let scaled = (base_ms as u64 * factor) / 1000;
+    (scaled as u32).max(MIN_INTERVAL_MS)
+}
+
+/// Format a count with thousands separators, e.g. `1,234,567`.
+pub fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The corner failsafe: true when the cursor is in the top-left corner
+/// zone of the virtual screen (within `CORNER_PX` of the corner whose
+/// coordinates are `vx`, `vy`). Slamming the mouse to the top-left is
+/// the classic panic gesture; while clicking, it stops the clicker.
+pub const CORNER_PX: i32 = 5;
+
+pub fn in_failsafe_corner(x: i32, y: i32, vx: i32, vy: i32) -> bool {
+    x <= vx + CORNER_PX && y <= vy + CORNER_PX
+}
+
 /// Compute the deadline for the click after `previous`, on a fixed
 /// cadence of one click every `interval`.
 ///
@@ -238,11 +313,14 @@ pub fn key_name(vk: u32) -> String {
     }
 }
 
-/// Persisted settings: the keybind and the click interval.
+/// Persisted settings: the keybind, the click interval, which mouse
+/// button is clicked, and whether interval jitter is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     pub keybind_vk: u32,
     pub interval_ms: u32,
+    pub button: ClickButton,
+    pub jitter: bool,
 }
 
 impl Default for Config {
@@ -250,6 +328,8 @@ impl Default for Config {
         Self {
             keybind_vk: DEFAULT_KEYBIND_VK,
             interval_ms: DEFAULT_INTERVAL_MS,
+            button: ClickButton::Left,
+            jitter: false,
         }
     }
 }
@@ -266,20 +346,48 @@ fn json_u32(text: &str, key: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Read one string field out of the hand-rolled JSON object.
+fn json_str(text: &str, key: &str) -> Option<String> {
+    let start = text.find(key)? + key.len();
+    let rest = text[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Read one boolean field out of the hand-rolled JSON object.
+fn json_bool(text: &str, key: &str) -> Option<bool> {
+    let start = text.find(key)? + key.len();
+    let rest = text[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {}\n}}\n",
-            self.keybind_vk, self.interval_ms
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {}\n}}\n",
+            self.keybind_vk,
+            self.interval_ms,
+            self.button.as_str(),
+            self.jitter
         )
     }
 
     /// Parse a config written by [`Config::to_json`]. Returns `None` for
     /// anything malformed or with invalid values, so the caller can fall
-    /// back to defaults without touching the user's file. A missing
-    /// `interval_ms` (a v0.1.x config file) defaults to
-    /// [`DEFAULT_INTERVAL_MS`].
+    /// back to defaults without touching the user's file. Missing fields
+    /// from older config versions default: `interval_ms` (pre-0.2) to
+    /// [`DEFAULT_INTERVAL_MS`], `button` (pre-0.4) to Left, `jitter`
+    /// (pre-0.4) to off.
     pub fn from_json(text: &str) -> Option<Self> {
         let vk = json_u32(text, "\"keybind_vk\"")?;
         if !is_valid_keybind(vk) {
@@ -294,9 +402,25 @@ impl Config {
             }
             None => DEFAULT_INTERVAL_MS,
         };
+        let button = match json_str(text, "\"button\"") {
+            Some(name) => ClickButton::from_name(&name)?,
+            None => ClickButton::Left,
+        };
+        let jitter = match json_bool(text, "\"jitter\"") {
+            Some(b) => b,
+            None => {
+                // Absent is fine (older file); present-but-garbled is not.
+                if text.contains("\"jitter\"") {
+                    return None;
+                }
+                false
+            }
+        };
         Some(Self {
             keybind_vk: vk,
             interval_ms,
+            button,
+            jitter,
         })
     }
 }
@@ -384,9 +508,81 @@ mod tests {
         let cfg = Config {
             keybind_vk: 0x77, // F8
             interval_ms: 250,
+            button: ClickButton::Right,
+            jitter: true,
         };
         let json = cfg.to_json();
         assert_eq!(Config::from_json(&json), Some(cfg));
+    }
+
+    #[test]
+    fn config_from_030_gets_button_and_jitter_defaults() {
+        // A v0.3.x config file has no button/jitter fields.
+        let cfg = Config::from_json("{\"keybind_vk\": 117, \"interval_ms\": 50}").unwrap();
+        assert_eq!(cfg.button, ClickButton::Left);
+        assert!(!cfg.jitter);
+    }
+
+    #[test]
+    fn config_rejects_unknown_button() {
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"button\": \"pinky\"}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"jitter\": \"yes\"}"),
+            None
+        );
+    }
+
+    #[test]
+    fn button_names_round_trip() {
+        for b in [ClickButton::Left, ClickButton::Right, ClickButton::Middle] {
+            assert_eq!(ClickButton::from_name(b.as_str()), Some(b));
+        }
+        assert_eq!(ClickButton::from_name("LEFT"), None);
+        assert_eq!(ClickButton::default(), ClickButton::Left);
+    }
+
+    #[test]
+    fn jitter_stays_within_ten_percent() {
+        for rand in [0u32, 1, 100, 200, 201, 999, u32::MAX] {
+            let j = jittered_interval_ms(100, rand);
+            assert!((90..=110).contains(&j), "rand {rand} gave {j}");
+            let big = jittered_interval_ms(60_000, rand);
+            assert!((54_000..=66_000).contains(&big), "rand {rand} gave {big}");
+        }
+        // The floor does not move: 1 ms stays 1 ms for every rand.
+        for rand in [0u32, 100, u32::MAX] {
+            assert_eq!(jittered_interval_ms(1, rand), 1);
+        }
+        // Both extremes are reachable.
+        assert_eq!(jittered_interval_ms(100, 0), 90);
+        assert_eq!(jittered_interval_ms(100, 200), 110);
+    }
+
+    #[test]
+    fn count_formatting() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(42), "42");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn failsafe_corner_is_top_left_only() {
+        assert!(in_failsafe_corner(0, 0, 0, 0));
+        assert!(in_failsafe_corner(CORNER_PX, CORNER_PX, 0, 0));
+        assert!(!in_failsafe_corner(CORNER_PX + 1, 0, 0, 0));
+        assert!(!in_failsafe_corner(0, CORNER_PX + 1, 0, 0));
+        // Other corners do not trigger it.
+        assert!(!in_failsafe_corner(1920, 1080, 0, 0));
+        // A virtual screen starting at (0,0) with a monitor to the left
+        // has a negative origin; the zone follows the origin.
+        assert!(in_failsafe_corner(-1920, 0, -1920, 0));
+        assert!(!in_failsafe_corner(0, 0, -1920, 0));
     }
 
     #[test]
