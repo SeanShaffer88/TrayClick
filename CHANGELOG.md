@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 — 2026-10-24
+
+- **New: you can now see when auto-clicking is on.** While clicking is active, the tray icon blinks — alternating every 500 ms between the normal icon and an inverted red "active" icon — and its tooltip reads "TrayClick — clicking ON". The moment clicking stops (keybind, Pause, or opening a settings window), the normal icon returns. No more guessing from the cursor alone.
+
 ## 0.2.2 — 2026-10-24
 
 Internal review and optimization pass — no intended behaviour changes, four reliability fixes and a smaller binary:
