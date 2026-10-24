@@ -38,19 +38,21 @@ mod win {
     use std::ffi::c_void;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{Duration, Instant};
 
     use trayclick::{
-        is_valid_interval, is_valid_keybind, key_name, Config, Engine, KeyPressDetector,
-        MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        is_valid_interval, is_valid_keybind, key_name, next_click_deadline, Config, Engine,
+        KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{
         GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
     };
-    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, SetBkMode, SetTextColor, TRANSPARENT};
+    use windows::Win32::Graphics::Gdi::{
+        CreateSolidBrush, SetBkMode, SetTextColor, HBRUSH, TRANSPARENT,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -92,9 +94,24 @@ mod win {
     /// press detector, so the key still held from choosing it does not
     /// count as a press. Clicking starts only on the next fresh press.
     static RESYNC_DETECTOR: AtomicBool = AtomicBool::new(false);
+    /// The registered `TaskbarCreated` message id (0 until `run` sets
+    /// it). Explorer broadcasts it when the taskbar is (re)created; the
+    /// tray icon must then be re-added or it stays gone after an
+    /// Explorer restart.
+    static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 
     fn engine() -> &'static Mutex<Engine> {
         ENGINE.get_or_init(|| Mutex::new(Engine::new()))
+    }
+
+    /// Lock the engine, recovering the state if a previous holder
+    /// panicked while holding it. `Engine` is two bools — always safe to
+    /// keep using — and panicking inside a window proc (or silently
+    /// ignoring the user's keypress) would be strictly worse.
+    fn lock_engine() -> MutexGuard<'static, Engine> {
+        engine()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -123,6 +140,15 @@ mod win {
         let path = config_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+        }
+        // Write to a temp file and rename it over the real one, so a
+        // crash mid-write can never leave a torn config behind (a torn
+        // file would make the next launch silently reset both settings
+        // to defaults). `fs::rename` replaces an existing destination
+        // on Windows. If the rename fails, fall back to a direct write.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, cfg.to_json()).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            return;
         }
         let _ = std::fs::write(&path, cfg.to_json());
     }
@@ -176,18 +202,57 @@ mod win {
         }
     }
 
-    fn clicker_thread() {
+    fn interval_dur() -> Duration {
+        Duration::from_millis(INTERVAL_MS.load(Ordering::SeqCst) as u64)
+    }
+
+    /// Wait until `deadline`, waking early if clicking stops.
+    ///
+    /// The bulk is slept in short slices; the final ~2 ms are spin-waited
+    /// because an OS sleep can overshoot by a whole timer tick (up to
+    /// ~15 ms at the default Windows resolution) — at a 1 ms interval
+    /// that overshoot would collapse the click rate. The spin runs only
+    /// while clicking, and only for the last slice of each interval.
+    fn wait_until(deadline: Instant) {
         loop {
-            let active = engine()
-                .lock()
-                .map(|e| e.is_clicking_now())
-                .unwrap_or(false);
-            if active {
-                send_left_click();
-                let interval = INTERVAL_MS.load(Ordering::SeqCst) as u64;
-                std::thread::sleep(Duration::from_millis(interval));
+            let now = Instant::now();
+            if now >= deadline || !lock_engine().is_clicking_now() {
+                return;
+            }
+            let remaining = deadline - now;
+            if remaining > Duration::from_millis(2) {
+                let slice = (remaining - Duration::from_millis(2)).min(Duration::from_millis(5));
+                std::thread::sleep(slice);
             } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    fn clicker_thread() {
+        // Clicks are scheduled on absolute deadlines (see
+        // `next_click_deadline`), so the time a click itself takes does
+        // not accumulate as drift the way sleep-after-click did.
+        let mut deadline: Option<Instant> = None;
+        loop {
+            if !lock_engine().is_clicking_now() {
+                deadline = None;
                 std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            match deadline {
+                None => {
+                    send_left_click();
+                    deadline = Some(Instant::now() + interval_dur());
+                }
+                Some(d) => {
+                    if Instant::now() >= d {
+                        send_left_click();
+                        deadline = Some(next_click_deadline(d, interval_dur(), Instant::now()));
+                    } else {
+                        wait_until(d);
+                    }
+                }
             }
         }
     }
@@ -267,7 +332,7 @@ mod win {
                 Err(_) => return,
             };
             let (paused, vk) = {
-                let e = engine().lock().unwrap();
+                let e = lock_engine();
                 (e.paused, KEYBIND_VK.load(Ordering::SeqCst))
             };
             let pause_label = if paused { "Resume" } else { "Pause" };
@@ -323,6 +388,19 @@ mod win {
         }
     }
 
+    /// The dialogs' dark background brush, created once and shared.
+    ///
+    /// A brush returned for `WM_CTLCOLORSTATIC` stays the app's
+    /// responsibility — creating a new one per repaint (as this code
+    /// used to) leaks a GDI object every time, toward the per-process
+    /// limit of 10,000. This one lives for the process lifetime.
+    fn dialog_bg_brush() -> HBRUSH {
+        static BRUSH: OnceLock<isize> = OnceLock::new();
+        let raw =
+            *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(0x00181818)).0 } as isize);
+        HBRUSH(raw as *mut c_void)
+    }
+
     // ---------- Set Keybind capture window ----------
 
     unsafe extern "system" fn capture_wndproc(
@@ -347,7 +425,7 @@ mod win {
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
                 SetTextColor(hdc, COLORREF(0x00F2F2F2));
                 SetBkMode(hdc, TRANSPARENT);
-                LRESULT(CreateSolidBrush(COLORREF(0x00181818)).0 as isize)
+                LRESULT(dialog_bg_brush().0 as isize)
             }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
@@ -369,9 +447,7 @@ mod win {
             return; // already open
         }
         // Stop any clicking in progress so stray clicks can't hit the dialog.
-        if let Ok(mut e) = engine().lock() {
-            e.clicking = false;
-        }
+        lock_engine().clicking = false;
         unsafe {
             let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
             static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -499,7 +575,7 @@ mod win {
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
                 SetTextColor(hdc, COLORREF(0x00F2F2F2));
                 SetBkMode(hdc, TRANSPARENT);
-                LRESULT(CreateSolidBrush(COLORREF(0x00181818)).0 as isize)
+                LRESULT(dialog_bg_brush().0 as isize)
             }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
@@ -520,9 +596,7 @@ mod win {
             return; // a dialog is already open
         }
         // Stop any clicking in progress so stray clicks can't hit the dialog.
-        if let Ok(mut e) = engine().lock() {
-            e.clicking = false;
-        }
+        lock_engine().clicking = false;
         unsafe {
             let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
             static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -660,6 +734,13 @@ mod win {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // Explorer (re)created the taskbar: re-add the tray icon, which
+        // does not survive an Explorer restart on its own.
+        let taskbar_msg = TASKBAR_CREATED_MSG.load(Ordering::SeqCst);
+        if taskbar_msg != 0 && msg == taskbar_msg {
+            tray_add(hwnd);
+            return LRESULT(0);
+        }
         match msg {
             WM_TRAYICON => {
                 let event = lparam.0 as u32;
@@ -669,17 +750,13 @@ mod win {
                 LRESULT(0)
             }
             m if m == WM_APP_TOGGLE => {
-                if let Ok(mut e) = engine().lock() {
-                    e.press_keybind();
-                }
+                lock_engine().press_keybind();
                 LRESULT(0)
             }
             WM_COMMAND => {
                 match wparam.0 & 0xFFFF {
                     ID_PAUSE_RESUME => {
-                        if let Ok(mut e) = engine().lock() {
-                            e.toggle_pause();
-                        }
+                        lock_engine().toggle_pause();
                     }
                     ID_SET_KEYBIND => open_capture_window(hwnd),
                     ID_SET_INTERVAL => open_interval_window(hwnd),
@@ -702,20 +779,29 @@ mod win {
 
     pub fn run() {
         // Single instance: a second copy would fight over the keybind.
-        unsafe {
-            let _mutex = CreateMutexW(None, true, w!("TrayClickSingleInstance"));
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                let text = wide("TrayClick is already running — check the tray.");
-                let title = wide("TrayClick");
+        // The handle is held in this binding until `run` returns at
+        // process exit. (In the `windows` crate `HANDLE` is a plain
+        // `Copy` value with no `Drop`, so an earlier draft of this code
+        // was reviewed as if the handle closed when its block ended —
+        // it never did; keeping the binding simply makes the lifetime
+        // explicit and guarantees nothing closes it early.)
+        let instance_mutex = unsafe { CreateMutexW(None, true, w!("TrayClickSingleInstance")) };
+        // Whether the call itself reports Ok or Err, ERROR_ALREADY_EXISTS
+        // is the signal that another copy holds the name.
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let text = wide("TrayClick is already running — check the tray.");
+            let title = wide("TrayClick");
+            unsafe {
                 MessageBoxW(
                     None,
                     PCWSTR(text.as_ptr()),
                     PCWSTR(title.as_ptr()),
                     MB_OK | MB_ICONINFORMATION,
                 );
-                return;
             }
+            return;
         }
+        let _instance_mutex = instance_mutex;
 
         let cfg = load_config();
         KEYBIND_VK.store(cfg.keybind_vk, Ordering::SeqCst);
@@ -751,6 +837,10 @@ mod win {
                 Err(_) => return,
             };
             MAIN_HWND.store(hwnd.0 as i32, Ordering::SeqCst);
+            let taskbar_id = RegisterWindowMessageW(w!("TaskbarCreated"));
+            if taskbar_id != 0 {
+                TASKBAR_CREATED_MSG.store(taskbar_id, Ordering::SeqCst);
+            }
             tray_add(hwnd);
 
             let mut msg = MSG::default();
