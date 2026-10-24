@@ -28,7 +28,7 @@ The builds are unsigned, so Windows SmartScreen may warn on first run: "More inf
    - **Credits** — version and credits.
    - **Exit** — removes the tray icon and quits.
 
-While clicking is on, clicking follows your cursor — it clicks wherever the pointer currently is, at the set interval, including if you move it.
+While clicking is on, clicking follows your cursor — it clicks wherever the pointer currently is, at the set interval, including if you move it. You can always tell it's on: **the tray icon blinks** (alternating with an inverted red icon) and its tooltip reads "TrayClick — clicking ON".
 
 ## Notes
 
