@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 — 2026-10-24
+
+Internal review and optimization pass — no intended behaviour changes, four reliability fixes and a smaller binary:
+
+- **Fix:** GDI object leak — the Set Keybind / Set Interval windows created a new background brush on every repaint and never released it. They now share one brush created once.
+- **Fix:** click timing no longer drifts. Clicks are scheduled on absolute deadlines, so the time a click itself takes is no longer added to every interval, and the wait is precise to ~2 ms instead of overshooting by up to a Windows timer tick (~15 ms) — small intervals (like the 1 ms preset) now track the setting far more closely. After the PC sleeps, clicking resumes on schedule instead of firing catch-up clicks.
+- **Fix:** the settings file is written atomically (temp file + rename), so a crash mid-save can no longer leave a torn config that resets your settings on the next launch.
+- **Fix:** if Explorer restarts, the tray icon is re-added automatically instead of leaving TrayClick running invisibly.
+- **Robustness:** the shared state lock now recovers instead of panicking (or silently ignoring the keybind) if it was ever poisoned.
+- **Smaller download:** the release build now uses LTO, symbol stripping and size optimization, so the portable exe is noticeably smaller than 0.2.1's 217,088 bytes.
+
 ## 0.2.1 — 2026-10-24
 
 - **Release downloads are now exactly two files:** an installer (`TrayClick-Setup-v0.2.1-x64.exe`, per-user Inno Setup install with Start menu shortcut and uninstaller; your settings in `%APPDATA%\TrayClick` are kept on uninstall) and a portable exe (`TrayClick-v0.2.1-portable.exe` — the same program, no install). The zip and SHA256SUMS.txt assets were dropped, and were also removed from the v0.1.0 and v0.2.0 releases.
