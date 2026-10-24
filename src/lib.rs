@@ -477,16 +477,7 @@ impl Config {
             Some(name) => ClickButton::from_name(&name)?,
             None => ClickButton::Left,
         };
-        let jitter = match json_bool(text, "\"jitter\"") {
-            Some(b) => b,
-            None => {
-                // Absent is fine (older file); present-but-garbled is not.
-                if text.contains("\"jitter\"") {
-                    return None;
-                }
-                false
-            }
-        };
+        let jitter = opt_bool(text, "\"jitter\"")?;
         // Fields added in 0.5.0; absent in older files, defaults apply.
         let mode = match json_str(text, "\"mode\"") {
             Some(name) => ClickMode::from_name(&name)?,
@@ -651,6 +642,18 @@ mod tests {
         assert!(is_valid_limit(0));
         assert!(is_valid_limit(MAX_LIMIT_CLICKS));
         assert!(!is_valid_limit(MAX_LIMIT_CLICKS + 1));
+    }
+
+    #[test]
+    fn config_rejects_garbled_optional_bools() {
+        // Present-but-garbled optional booleans reject the whole file
+        // (the caller then falls back to defaults); absent ones default.
+        for field in ["jitter", "lock_position", "start_on_launch"] {
+            let garbled = format!("{{\"keybind_vk\": 117, \"{field}\": \"yes\"}}");
+            assert_eq!(Config::from_json(&garbled), None, "{field}");
+            let absent = Config::from_json("{\"keybind_vk\": 117}").unwrap();
+            assert!(!absent.jitter && !absent.lock_position && !absent.start_on_launch);
+        }
     }
 
     #[test]
