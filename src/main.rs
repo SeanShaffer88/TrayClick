@@ -21,6 +21,14 @@
 //! Safety: while clicking, slamming the mouse into the top-left corner
 //! of the screen stops clicking immediately (the corner failsafe).
 //!
+//! The Set Interval window also carries the 0.5.0 settings: the mode
+//! (Click, or Hold — the keybind holds the button down until pressed
+//! again; every stop path releases it), the target (follow the cursor,
+//! or lock to the position where clicking started — each click moves
+//! to the locked point, clicks, and puts the cursor back), an
+//! auto-stop limit in clicks per run (0 = none), and start-on-launch
+//! (click mode only).
+//!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
 //! indefinitely, until the keybind is pressed again. While clicking is
@@ -50,9 +58,10 @@ mod win {
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        format_count, ico_image_for_size, in_failsafe_corner, is_valid_interval, is_valid_keybind,
-        jittered_interval_ms, key_name, next_click_deadline, ClickButton, Config, Engine,
-        KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        absolute_coord, format_count, ico_image_for_size, in_failsafe_corner, is_valid_interval,
+        is_valid_keybind, is_valid_limit, jittered_interval_ms, key_name, next_click_deadline,
+        ClickButton, ClickMode, Config, Engine, KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS,
+        VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
@@ -70,9 +79,10 @@ mod win {
     };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+        GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+        MOUSEINPUT, MOUSE_EVENT_FLAGS,
     };
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -87,6 +97,8 @@ mod win {
     /// Posted by the click thread when the corner failsafe trips, so the
     /// UI thread can settle the tray indicator.
     const WM_APP_FAILSAFE: u32 = WM_APP + 2;
+    /// Posted by the click thread when the auto-stop limit is reached.
+    const WM_APP_LIMIT: u32 = WM_APP + 3;
 
     const TRAY_ID: u32 = 1;
 
@@ -110,6 +122,11 @@ mod win {
     const ID_IV_BTN_RIGHT: usize = 2006;
     const ID_IV_BTN_MIDDLE: usize = 2007;
     const ID_IV_JITTER: usize = 2008;
+    const ID_IV_MODE: usize = 2009;
+    const ID_IV_POS: usize = 2010;
+    const ID_IV_LIMIT_EDIT: usize = 2011;
+    const ID_IV_LIMIT_SET: usize = 2012;
+    const ID_IV_LAUNCH: usize = 2013;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
@@ -121,6 +138,25 @@ mod win {
     /// Clicks sent since the process started (shown in the tooltip and
     /// in Credits).
     static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// The mode: 0 = Click, 1 = Hold.
+    static MODE: AtomicU32 = AtomicU32::new(0);
+    /// Whether clicks lock to the position captured when clicking
+    /// started instead of following the cursor.
+    static LOCK_POS: AtomicBool = AtomicBool::new(false);
+    /// The captured lock point and whether one is set for this run.
+    static LOCK_X: AtomicI32 = AtomicI32::new(0);
+    static LOCK_Y: AtomicI32 = AtomicI32::new(0);
+    static LOCK_SET: AtomicBool = AtomicBool::new(false);
+    /// Auto-stop limit in clicks per run; 0 = no limit.
+    static LIMIT_CLICKS: AtomicU32 = AtomicU32::new(0);
+    /// Clicks sent in the current run (reset on every activation).
+    static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// Whether clicking starts when TrayClick launches (click mode).
+    static START_ON_LAUNCH: AtomicBool = AtomicBool::new(false);
+    /// Whether the mouse button is currently held down (hold mode).
+    /// Every stop path funnels through `refresh_indicator`, which calls
+    /// `sync_hold_state` — so every stop path releases the button.
+    static HELD: AtomicBool = AtomicBool::new(false);
     static MAIN_HWND: AtomicI32 = AtomicI32::new(0);
     /// True while a dialog window (Set Keybind or Set Interval) is open;
     /// the polling thread must not treat keys pressed there as toggles.
@@ -208,6 +244,20 @@ mod win {
         }
     }
 
+    fn mode_u32(m: ClickMode) -> u32 {
+        match m {
+            ClickMode::Click => 0,
+            ClickMode::Hold => 1,
+        }
+    }
+
+    fn current_mode() -> ClickMode {
+        match MODE.load(Ordering::SeqCst) {
+            1 => ClickMode::Hold,
+            _ => ClickMode::Click,
+        }
+    }
+
     /// The live settings as a `Config`, for persisting after a change.
     fn current_config() -> Config {
         Config {
@@ -215,6 +265,10 @@ mod win {
             interval_ms: INTERVAL_MS.load(Ordering::SeqCst),
             button: current_button(),
             jitter: JITTER_ON.load(Ordering::SeqCst),
+            mode: current_mode(),
+            lock_position: LOCK_POS.load(Ordering::SeqCst),
+            limit_clicks: LIMIT_CLICKS.load(Ordering::SeqCst),
+            start_on_launch: START_ON_LAUNCH.load(Ordering::SeqCst),
         }
     }
 
@@ -225,30 +279,136 @@ mod win {
 
     // ---------- click + keybind worker threads ----------
 
-    fn send_click() {
-        let (down, up): (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) = match current_button() {
+    /// The SendInput down/up flags for a button.
+    fn button_flags(b: ClickButton) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
+        match b {
             ClickButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
             ClickButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
             ClickButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-        };
-        let make = |dw_flags: MOUSE_EVENT_FLAGS| INPUT {
+        }
+    }
+
+    fn mouse_input(dx: i32, dy: i32, dw_flags: MOUSE_EVENT_FLAGS) -> INPUT {
+        INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
+                    dx,
+                    dy,
                     mouseData: 0,
                     dwFlags: dw_flags,
                     time: 0,
                     dwExtraInfo: 0,
                 },
             },
-        };
-        let inputs = [make(down), make(up)];
+        }
+    }
+
+    /// Press (`down = true`) or release the chosen button once — the
+    /// hold mode primitives.
+    fn send_button(down: bool) {
+        let (d, u) = button_flags(current_button());
+        let inputs = [mouse_input(0, 0, if down { d } else { u })];
         unsafe {
             SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         }
+    }
+
+    fn send_click() {
+        let (down, up) = button_flags(current_button());
+        if LOCK_POS.load(Ordering::SeqCst) && LOCK_SET.load(Ordering::SeqCst) {
+            send_click_locked(down, up);
+        } else {
+            let inputs = [mouse_input(0, 0, down), mouse_input(0, 0, up)];
+            unsafe {
+                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
         CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Click at the locked point, then put the cursor back where the
+    /// user left it — all in one SendInput batch, so the pointer only
+    /// leaves for the instant of the click and the user can keep
+    /// working elsewhere.
+    fn send_click_locked(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS) {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let abs_to = |x: i32, y: i32| {
+                mouse_input(
+                    absolute_coord(x, vx, vw) as i32,
+                    absolute_coord(y, vy, vh) as i32,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                )
+            };
+            let target = abs_to(LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst));
+            let mut cur = POINT::default();
+            if GetCursorPos(&mut cur).is_ok() {
+                let back = abs_to(cur.x, cur.y);
+                let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up), back];
+                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            } else {
+                let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up)];
+                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+    }
+
+    /// Whether the current run has reached the auto-stop limit.
+    fn limit_reached() -> bool {
+        let limit = LIMIT_CLICKS.load(Ordering::SeqCst);
+        limit > 0 && RUN_COUNT.load(Ordering::Relaxed) >= limit as u64
+    }
+
+    /// Post a message to the main window (used by the worker threads).
+    fn post_main(msg: u32) {
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw != 0 {
+            let hwnd = HWND(raw as isize as *mut c_void);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    /// Capture the cursor as the lock point for this run.
+    fn capture_lock_point() {
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                LOCK_X.store(pt.x, Ordering::SeqCst);
+                LOCK_Y.store(pt.y, Ordering::SeqCst);
+                LOCK_SET.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Release the button if it is held, unconditionally.
+    fn sync_hold_state_released() {
+        if HELD.swap(false, Ordering::SeqCst) {
+            send_button(false);
+        }
+    }
+
+    /// Keep the physical button in sync with the engine: in hold mode
+    /// the button is down exactly while the engine is active. Called at
+    /// the end of `refresh_indicator`, which every state change on the
+    /// UI thread funnels through — so the keybind, Pause, the failsafe,
+    /// the limit, opening a dialog, and Exit all release a held button.
+    fn sync_hold_state() {
+        let want = lock_engine().is_clicking_now() && current_mode() == ClickMode::Hold;
+        let held = HELD.load(Ordering::SeqCst);
+        if want && !held {
+            send_button(true);
+            HELD.store(true, Ordering::SeqCst);
+        } else if !want && held {
+            send_button(false);
+            HELD.store(false, Ordering::SeqCst);
+        }
     }
 
     /// A tiny xorshift PRNG for interval jitter — good enough to vary
@@ -295,13 +455,7 @@ mod win {
     /// thread so it can settle the tray indicator.
     fn trip_failsafe() {
         lock_engine().clicking = false;
-        let raw = MAIN_HWND.load(Ordering::SeqCst);
-        if raw != 0 {
-            let hwnd = HWND(raw as isize as *mut c_void);
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), WM_APP_FAILSAFE, WPARAM(0), LPARAM(0));
-            }
-        }
+        post_main(WM_APP_FAILSAFE);
     }
 
     /// Wait until `deadline`, waking early if clicking stops.
@@ -348,6 +502,16 @@ mod win {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
+            if current_mode() == ClickMode::Hold {
+                // Nothing to schedule — the button is simply down. Just
+                // keep watch for the failsafe.
+                if cursor_in_failsafe() {
+                    trip_failsafe();
+                }
+                deadline = None;
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             if cursor_in_failsafe() {
                 trip_failsafe();
                 deadline = None;
@@ -370,6 +534,11 @@ mod win {
                         wait_until(d);
                     }
                 }
+            }
+            if limit_reached() {
+                lock_engine().clicking = false;
+                post_main(WM_APP_LIMIT);
+                deadline = None;
             }
         }
     }
@@ -485,12 +654,17 @@ mod win {
         }
     }
 
-    /// The tooltip shown while clicking is on, with the session count.
+    /// The tooltip shown while active: the click count in click mode,
+    /// the held button in hold mode.
     fn on_tooltip() -> String {
-        format!(
-            "TrayClick — clicking ON · {} clicks",
-            format_count(CLICK_COUNT.load(Ordering::Relaxed))
-        )
+        if current_mode() == ClickMode::Hold {
+            format!("TrayClick — holding {}", current_button().label())
+        } else {
+            format!(
+                "TrayClick — clicking ON · {} clicks",
+                format_count(CLICK_COUNT.load(Ordering::Relaxed))
+            )
+        }
     }
 
     /// Reflect the engine state in the tray. While clicking is on, the
@@ -512,6 +686,7 @@ mod win {
             BLINK_NORMAL_SHOWN.store(true, Ordering::SeqCst);
             tray_modify(hwnd, app_icon(), "TrayClick");
         }
+        sync_hold_state();
     }
 
     // ---------- Start with Windows (HKCU Run key) ----------
@@ -671,6 +846,12 @@ mod win {
             "off"
         };
         let clicks = format_count(CLICK_COUNT.load(Ordering::Relaxed));
+        let mode = current_mode().label();
+        let target = if LOCK_POS.load(Ordering::SeqCst) {
+            "Locked position"
+        } else {
+            "Follow cursor"
+        };
         let text = wide(&format!(
             "TrayClick {}\r\n\r\n\
              Created by SEAN (SeanShaffer88).\r\n\
@@ -678,6 +859,8 @@ mod win {
              Keybind: {keybind} — start or stop auto clicking at the cursor.\r\n\
              Interval: {interval} ms (set it from the tray menu).\r\n\
              Button: {button}\r\n\
+             Mode: {mode}\r\n\
+             Target: {target}\r\n\
              Jitter: {jitter}\r\n\
              Clicks this session: {clicks}\r\n\r\n\
              Safety: while clicking, slam the mouse into the top-left corner\
@@ -875,6 +1058,10 @@ mod win {
                     ID_IV_BTN_RIGHT => apply_button(hwnd, ClickButton::Right),
                     ID_IV_BTN_MIDDLE => apply_button(hwnd, ClickButton::Middle),
                     ID_IV_JITTER => apply_jitter(hwnd),
+                    ID_IV_MODE => apply_mode(hwnd),
+                    ID_IV_POS => apply_pos(hwnd),
+                    ID_IV_LIMIT_SET => apply_limit(hwnd),
+                    ID_IV_LAUNCH => apply_launch(hwnd),
                     // IDCANCEL (2) arrives when Esc is pressed via the
                     // dialog message loop.
                     2 => {
@@ -921,6 +1108,26 @@ mod win {
         }
     }
 
+    fn mode_caption() -> String {
+        format!("Mode: {}", current_mode().label())
+    }
+
+    fn pos_caption() -> &'static str {
+        if LOCK_POS.load(Ordering::SeqCst) {
+            "Position: Locked"
+        } else {
+            "Position: Follow"
+        }
+    }
+
+    fn launch_caption() -> &'static str {
+        if START_ON_LAUNCH.load(Ordering::SeqCst) {
+            "Start on launch: On"
+        } else {
+            "Start on launch: Off"
+        }
+    }
+
     /// Repaint the button-row and jitter captions after a change.
     fn relabel_interval_controls(hwnd: HWND) {
         unsafe {
@@ -937,6 +1144,18 @@ mod win {
             if let Ok(jb) = GetDlgItem(Some(hwnd), ID_IV_JITTER as i32) {
                 let t = wide(jitter_caption());
                 let _ = SetWindowTextW(jb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(mb) = GetDlgItem(Some(hwnd), ID_IV_MODE as i32) {
+                let t = wide(&mode_caption());
+                let _ = SetWindowTextW(mb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(pb) = GetDlgItem(Some(hwnd), ID_IV_POS as i32) {
+                let t = wide(pos_caption());
+                let _ = SetWindowTextW(pb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(lb) = GetDlgItem(Some(hwnd), ID_IV_LAUNCH as i32) {
+                let t = wide(launch_caption());
+                let _ = SetWindowTextW(lb, PCWSTR(t.as_ptr()));
             }
         }
     }
@@ -959,6 +1178,76 @@ mod win {
         relabel_interval_controls(hwnd);
         unsafe {
             let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_mode(hwnd: HWND) {
+        let next = match current_mode() {
+            ClickMode::Click => ClickMode::Hold,
+            ClickMode::Hold => ClickMode::Click,
+        };
+        MODE.store(mode_u32(next), Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_pos(hwnd: HWND) {
+        let on = !LOCK_POS.load(Ordering::SeqCst);
+        LOCK_POS.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_launch(hwnd: HWND) {
+        let on = !START_ON_LAUNCH.load(Ordering::SeqCst);
+        START_ON_LAUNCH.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Set the auto-stop limit from the edit control (0 = no limit).
+    /// Like the other toggles this applies at once and keeps the
+    /// window open; only a bad value interrupts, with a warning.
+    fn apply_limit(hwnd: HWND) {
+        let mut ok = false;
+        if let Ok(edit) = unsafe { GetDlgItem(Some(hwnd), ID_IV_LIMIT_EDIT as i32) } {
+            let mut buf = [0u16; 16];
+            let n = unsafe { GetWindowTextW(edit, &mut buf) };
+            if n > 0 {
+                let text = String::from_utf16_lossy(&buf[..n as usize]);
+                if let Ok(v) = text.trim().parse::<u32>() {
+                    if is_valid_limit(v) {
+                        LIMIT_CLICKS.store(v, Ordering::SeqCst);
+                        save_config(current_config());
+                        ok = true;
+                    }
+                }
+            }
+        }
+        if ok {
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+        } else {
+            let text = wide("Enter a whole number of clicks from 0 (no limit) to 100000000.");
+            let title = wide("TrayClick — Set Interval");
+            unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
         }
     }
 
@@ -985,7 +1274,7 @@ mod win {
                 RegisterClassW(&wc);
             }
             let width = 396;
-            let height = 264;
+            let height = 356;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = match CreateWindowExW(
@@ -1140,7 +1429,7 @@ mod win {
             );
             let _ = child(
                 w!("STATIC"),
-                "Button and jitter apply at once. Jitter varies the interval by up to ±10%.",
+                "Mode and target:",
                 label_style,
                 16,
                 156,
@@ -1148,12 +1437,74 @@ mod win {
                 20,
                 0,
             );
+            let mode_cap = mode_caption();
+            let _ = child(
+                w!("BUTTON"),
+                &mode_cap,
+                btn_style,
+                16,
+                180,
+                150,
+                30,
+                ID_IV_MODE,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                pos_caption(),
+                btn_style,
+                176,
+                180,
+                188,
+                30,
+                ID_IV_POS,
+            );
             let _ = child(
                 w!("STATIC"),
-                "Presets apply at once. Custom: type a value and click Apply (range 1–60000). Esc cancels.",
+                "Stop after (clicks, 0 = no limit):",
                 label_style,
                 16,
-                188,
+                224,
+                216,
+                20,
+                0,
+            );
+            let limit_now = LIMIT_CLICKS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &limit_now,
+                edit_style,
+                238,
+                218,
+                62,
+                30,
+                ID_IV_LIMIT_EDIT,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                "Set",
+                btn_style,
+                308,
+                218,
+                56,
+                30,
+                ID_IV_LIMIT_SET,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                launch_caption(),
+                btn_style,
+                16,
+                256,
+                348,
+                30,
+                ID_IV_LAUNCH,
+            );
+            let _ = child(
+                w!("STATIC"),
+                "Presets apply at once. Custom interval: type a value and click Apply (range 1–60000). Everything else applies at once. Esc cancels.",
+                label_style,
+                16,
+                296,
                 360,
                 36,
                 0,
@@ -1184,6 +1535,11 @@ mod win {
                 refresh_indicator(hwnd);
                 LRESULT(0)
             }
+            m if m == WM_APP_LIMIT => {
+                // The clicker stopped at the auto-stop limit; settle.
+                refresh_indicator(hwnd);
+                LRESULT(0)
+            }
             WM_TRAYICON => {
                 let event = lparam.0 as u32;
                 if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
@@ -1193,6 +1549,14 @@ mod win {
             }
             m if m == WM_APP_TOGGLE => {
                 lock_engine().press_keybind();
+                if lock_engine().is_clicking_now() {
+                    RUN_COUNT.store(0, Ordering::Relaxed);
+                    if current_mode() == ClickMode::Click && LOCK_POS.load(Ordering::SeqCst) {
+                        capture_lock_point();
+                    }
+                } else {
+                    LOCK_SET.store(false, Ordering::SeqCst);
+                }
                 refresh_indicator(hwnd);
                 LRESULT(0)
             }
@@ -1224,6 +1588,7 @@ mod win {
                     ID_START_WITH_WINDOWS => set_autostart(!autostart_enabled()),
                     ID_CREDITS => show_credits(hwnd),
                     ID_EXIT => {
+                        sync_hold_state_released();
                         tray_remove(hwnd);
                         let _ = DestroyWindow(hwnd);
                     }
@@ -1232,6 +1597,8 @@ mod win {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // Belt and braces: never exit with a button held down.
+                sync_hold_state_released();
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -1270,6 +1637,16 @@ mod win {
         INTERVAL_MS.store(cfg.interval_ms, Ordering::SeqCst);
         BUTTON.store(button_u32(cfg.button), Ordering::SeqCst);
         JITTER_ON.store(cfg.jitter, Ordering::SeqCst);
+        MODE.store(mode_u32(cfg.mode), Ordering::SeqCst);
+        LOCK_POS.store(cfg.lock_position, Ordering::SeqCst);
+        LIMIT_CLICKS.store(cfg.limit_clicks, Ordering::SeqCst);
+        START_ON_LAUNCH.store(cfg.start_on_launch, Ordering::SeqCst);
+        if cfg.start_on_launch && cfg.mode == ClickMode::Click {
+            lock_engine().clicking = true;
+            if cfg.lock_position {
+                capture_lock_point();
+            }
+        }
 
         std::thread::spawn(clicker_thread);
         std::thread::spawn(keybind_thread);
@@ -1306,6 +1683,7 @@ mod win {
                 TASKBAR_CREATED_MSG.store(taskbar_id, Ordering::SeqCst);
             }
             tray_add(hwnd);
+            refresh_indicator(hwnd);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
