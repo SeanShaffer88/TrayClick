@@ -2,11 +2,11 @@
 
 ## TL;DR
 
-A tiny Windows tray auto clicker. TrayClick sits in the notification area with no main window. Press the keybind (default **F6**) and it left-clicks at your cursor every **100 ms**, indefinitely, until you press the keybind again. Left- or right-click the tray icon for a menu with exactly four options: **Pause/Resume**, **Set Keybind**, **Credits**, and **Exit**. That's the whole program.
+A tiny Windows tray auto clicker. TrayClick sits in the notification area with no main window. Press the keybind (default **F6**) and it left-clicks at your cursor at the set interval (default **100 ms**), indefinitely, until you press the keybind again. Left- or right-click the tray icon for a menu with exactly five options: **Pause/Resume**, **Set Keybind**, **Set Interval**, **Credits**, and **Exit**. That's the whole program.
 
 - Windows 10 or later, x64
-- One small executable, no installer, nothing to configure beyond the keybind
-- The keybind you pick is remembered between runs (`%APPDATA%\TrayClick\config.json`)
+- One small executable, no installer, nothing to configure beyond the keybind and interval
+- The keybind and interval you pick are remembered between runs (`%APPDATA%\TrayClick\config.json`)
 
 ## How to use
 
@@ -14,17 +14,18 @@ A tiny Windows tray auto clicker. TrayClick sits in the notification area with n
 2. Press **F6** to start auto-clicking at the cursor. Press **F6** again to stop.
 3. Click the tray icon (left or right click — both work) for the menu:
    - **Pause** — stops clicking immediately and ignores the keybind. The item becomes **Resume**; resuming does not restart clicking until you press the keybind again.
-   - **Set Keybind [F6]** — opens a small window; press any key to make it the new toggle key (`Esc` cancels). Mouse buttons can't be assigned, for obvious reasons.
+   - **Set Keybind [F6]** — opens a small window; press any key to make it the new toggle key (`Esc` cancels). Mouse buttons can't be assigned, for obvious reasons. Assigning a key never starts clicking by itself — clicking starts when you press the new keybind again.
+   - **Set Interval [100 ms]** — opens a small window with **1 ms** and **100 ms** preset buttons, or type any custom interval in milliseconds (1–60000) and click Apply.
    - **Credits** — version and credits.
    - **Exit** — removes the tray icon and quits.
 
-While clicking is on, clicking follows your cursor — it clicks wherever the pointer currently is, every 100 ms, including if you move it.
+While clicking is on, clicking follows your cursor — it clicks wherever the pointer currently is, at the set interval, including if you move it.
 
 ## Notes
 
 - Only one copy runs at a time; starting a second copy just tells you it's already running.
 - TrayClick clicks with the standard Windows `SendInput` API at the current cursor position. It does not move the cursor, record anything, or phone home. It works completely offline.
-- The click interval is fixed at 100 ms by design — this program's whole point is doing one thing simply.
+- The click interval defaults to 100 ms and can be set to 1 ms, 100 ms, or any custom value from 1 to 60000 ms in the Set Interval window. Very small intervals click as fast as Windows can deliver them; the effective rate is bounded by the OS timer and message delivery.
 
 ## Screenshots
 
