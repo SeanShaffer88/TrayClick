@@ -217,6 +217,19 @@ pub fn key_name(vk: u32) -> String {
         0x2E => "Delete".to_string(),
         0x5B => "Left Win".to_string(),
         0x5C => "Right Win".to_string(),
+        // OEM punctuation keys (US layout): VK_OEM_1/2/3/4/5/6/7,
+        // VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD.
+        0xBA => ";".to_string(),
+        0xBB => "=".to_string(),
+        0xBC => ",".to_string(),
+        0xBD => "-".to_string(),
+        0xBE => ".".to_string(),
+        0xBF => "/".to_string(),
+        0xC0 => "`".to_string(),
+        0xDB => "[".to_string(),
+        0xDC => "\\".to_string(),
+        0xDD => "]".to_string(),
+        0xDE => "'".to_string(),
         0x70..=0x87 => format!("F{}", vk - 0x70 + 1),
         0x60..=0x69 => format!("Num {}", vk - 0x60),
         0x30..=0x39 => ((vk as u8) as char).to_string(),
@@ -349,6 +362,21 @@ mod tests {
         assert_eq!(key_name(0x20), "Space");
         assert_eq!(key_name(0x0D), "Enter");
         assert_eq!(key_name(0x2E), "Delete");
+    }
+
+    #[test]
+    fn key_names_oem_punctuation() {
+        assert_eq!(key_name(0xBA), ";");
+        assert_eq!(key_name(0xBB), "=");
+        assert_eq!(key_name(0xBC), ",");
+        assert_eq!(key_name(0xBD), "-");
+        assert_eq!(key_name(0xBE), ".");
+        assert_eq!(key_name(0xBF), "/");
+        assert_eq!(key_name(0xC0), "`");
+        assert_eq!(key_name(0xDB), "[");
+        assert_eq!(key_name(0xDC), "\\");
+        assert_eq!(key_name(0xDD), "]");
+        assert_eq!(key_name(0xDE), "'");
     }
 
     #[test]
