@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 — 2026-10-24
+
+- **Polish:** the OEM punctuation keys now show by name in the menu and Credits instead of a hex code — `\` (which showed as "Key 0xDC"), `/`, `;`, `'`, `[`, `]`, `,`, `.`, `-`, `=`, and `` ` ``. Prompted by a field screenshot: SEAN's own keybind is the `\` key, and the menu called it "Key 0xDC".
+- **Installer:** the "Launch TrayClick now" checkbox on the installer's final screen is now checked by default (it was opt-in before).
+
 ## 0.3.0 — 2026-10-24
 
 - **New: you can now see when auto-clicking is on.** While clicking is active, the tray icon blinks — alternating every 500 ms between the normal icon and an inverted red "active" icon — and its tooltip reads "TrayClick — clicking ON". The moment clicking stops (keybind, Pause, or opening a settings window), the normal icon returns. No more guessing from the cursor alone.
