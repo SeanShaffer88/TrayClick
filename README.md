@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-A tiny Windows tray auto clicker. TrayClick sits in the notification area with no main window. Press the keybind (default **F6**) and it left-clicks at your cursor at the set interval (default **100 ms**), indefinitely, until you press the keybind again. Left- or right-click the tray icon for a menu with exactly five options: **Pause/Resume**, **Set Keybind**, **Set Interval**, **Credits**, and **Exit**. That's the whole program.
+A tiny Windows tray auto clicker. TrayClick sits in the notification area with no main window. Press the keybind (default **F6**) and it clicks at your cursor at the set interval (default **100 ms**), indefinitely, until you press the keybind again. Left- or right-click the tray icon for a menu with exactly six options: **Pause/Resume**, **Set Keybind**, **Set Interval**, **Start with Windows**, **Credits**, and **Exit**. That's the whole program.
 
 - Windows 10 or later, x64
 - One small executable, no installer, nothing to configure beyond the keybind and interval
@@ -24,25 +24,29 @@ The builds are unsigned, so Windows SmartScreen may warn on first run: "More inf
 3. Click the tray icon (left or right click — both work) for the menu:
    - **Pause** — stops clicking immediately and ignores the keybind. The item becomes **Resume**; resuming does not restart clicking until you press the keybind again.
    - **Set Keybind [F6]** — opens a small window; press any key to make it the new toggle key (`Esc` cancels). Mouse buttons can't be assigned, for obvious reasons. Assigning a key never starts clicking by itself — clicking starts when you press the new keybind again.
-   - **Set Interval [100 ms]** — opens a small window with **1 ms** and **100 ms** preset buttons, or type any custom interval in milliseconds (1–60000) and click Apply.
-   - **Credits** — version and credits.
+   - **Set Interval [100 ms]** — opens a small window with **1 ms** and **100 ms** preset buttons, or type any custom interval in milliseconds (1–60000) and click Apply. The same window chooses the **mouse button** (left, right, or middle) and toggles **jitter**, which varies each interval by up to ±10%.
+   - **Start with Windows** — checked when TrayClick is set to launch at sign-in (per-user, no admin). Uncheck to stop launching. If you use the portable exe, the entry points at wherever the exe is, so moving it means toggling this once more.
+   - **Credits** — version, current settings, and how many clicks this session has fired.
    - **Exit** — removes the tray icon and quits.
 
-While clicking is on, clicking follows your cursor — it clicks wherever the pointer currently is, at the set interval, including if you move it. You can always tell it's on: **the tray icon blinks** (alternating with an inverted red icon) and its tooltip reads "TrayClick — clicking ON".
+While clicking is on, clicking follows your cursor — it clicks wherever the pointer currently is, at the set interval, including if you move it. You can always tell it's on: **the tray icon blinks** (alternating with an inverted red icon) and its tooltip reads "TrayClick — clicking ON" with the running click count.
+
+**Safety:** while clicking is on, slam the mouse into the **top-left corner of the screen** to stop clicking instantly — handy at fast intervals, before you reach for the keybind.
 
 ## Notes
 
 - Only one copy runs at a time; starting a second copy just tells you it's already running.
 - TrayClick clicks with the standard Windows `SendInput` API at the current cursor position. It does not move the cursor, record anything, or phone home. It works completely offline.
 - The click interval defaults to 100 ms and can be set to 1 ms, 100 ms, or any custom value from 1 to 60000 ms in the Set Interval window. Very small intervals click as fast as Windows can deliver them; the effective rate is bounded by the OS timer and message delivery.
+- Settings — keybind, interval, mouse button, and jitter — are saved in `%APPDATA%\TrayClick\config.json` and survive restarts.
 
 ## Screenshots
 
-The tray menu — all five items, with the current keybind and interval shown in brackets:
+The tray menu (captured on v0.3.1; v0.4.0 adds a sixth item, **Start with Windows**), with the current keybind and interval shown in brackets:
 
 ![TrayClick tray menu](docs/screenshots/tray-menu.png)
 
-The Set Interval window — 1 ms and 100 ms presets, or type any custom value and click Apply:
+The Set Interval window (captured on v0.3.1; the v0.4.0 window is taller, with the mouse-button choice and the jitter toggle below the presets):
 
 ![TrayClick Set Interval window](docs/screenshots/set-interval.png)
 
