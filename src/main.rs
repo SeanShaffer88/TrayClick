@@ -18,7 +18,10 @@
 //!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
-//! indefinitely, until the keybind is pressed again.
+//! indefinitely, until the keybind is pressed again. While clicking is
+//! on, the tray icon blinks (alternating with an inverted red icon every
+//! 500 ms) and its tooltip reads "TrayClick — clicking ON", so the state
+//! is visible at a glance.
 //!
 //! All state-machine logic lives in the platform-independent library
 //! (`lib.rs`) and is unit-tested there; this file is the Win32 shell.
@@ -42,8 +45,8 @@ mod win {
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        is_valid_interval, is_valid_keybind, key_name, next_click_deadline, Config, Engine,
-        KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        ico_image_for_size, is_valid_interval, is_valid_keybind, key_name, next_click_deadline,
+        Config, Engine, KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
@@ -60,7 +63,8 @@ mod win {
         MOUSEEVENTF_LEFTUP, MOUSEINPUT,
     };
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+        NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -70,6 +74,10 @@ mod win {
     const WM_APP_TOGGLE: u32 = WM_APP + 1;
 
     const TRAY_ID: u32 = 1;
+
+    /// Timer that blinks the tray icon while clicking is on.
+    const ID_BLINK_TIMER: usize = 1;
+    const BLINK_MS: u32 = 500;
 
     const ID_PAUSE_RESUME: usize = 1001;
     const ID_SET_KEYBIND: usize = 1002;
@@ -99,6 +107,10 @@ mod win {
     /// tray icon must then be re-added or it stays gone after an
     /// Explorer restart.
     static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+    /// Which blink phase is on screen: `true` while the normal icon is
+    /// showing, `false` while the active icon is. Only touched on the
+    /// UI thread (timer + state-change handlers).
+    static BLINK_NORMAL_SHOWN: AtomicBool = AtomicBool::new(true);
 
     fn engine() -> &'static Mutex<Engine> {
         ENGINE.get_or_init(|| Mutex::new(Engine::new()))
@@ -323,6 +335,72 @@ mod win {
         }
     }
 
+    /// The "clicking ON" icon (inverted red target), built once from the
+    /// embedded `assets/icon_active.ico` bytes. Falls back to the normal
+    /// icon if the embedded data ever fails to parse, so the worst case
+    /// is a steady icon, not a broken one.
+    fn active_icon() -> HICON {
+        static ICON: OnceLock<isize> = OnceLock::new();
+        let raw = *ICON.get_or_init(|| {
+            let bytes = include_bytes!("../assets/icon_active.ico");
+            let desired = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
+            let created = ico_image_for_size(bytes, desired).and_then(|image| unsafe {
+                CreateIconFromResourceEx(
+                    image,
+                    true,
+                    0x0003_0000,
+                    desired as i32,
+                    desired as i32,
+                    LR_DEFAULTCOLOR,
+                )
+                .ok()
+            });
+            created.map(|h| h.0 as isize).unwrap_or(0)
+        });
+        if raw == 0 {
+            app_icon()
+        } else {
+            HICON(raw as *mut c_void)
+        }
+    }
+
+    /// Swap the tray icon and tooltip in place.
+    fn tray_modify(hwnd: HWND, icon: HICON, tip_text: &str) {
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = TRAY_ID;
+            nid.uFlags = NIF_ICON | NIF_TIP;
+            nid.hIcon = icon;
+            let tip = wide(tip_text);
+            let n = tip.len().min(nid.szTip.len());
+            nid.szTip[..n].copy_from_slice(&tip[..n]);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    /// Reflect the engine state in the tray. While clicking is on, the
+    /// icon blinks between the normal and active icons (see the
+    /// `WM_TIMER` handler) and the tooltip says so; when off, the timer
+    /// stops and the normal icon is restored. Called after every engine
+    /// state change, which all happen on the UI thread.
+    fn refresh_indicator(hwnd: HWND) {
+        if lock_engine().is_clicking_now() {
+            BLINK_NORMAL_SHOWN.store(false, Ordering::SeqCst);
+            tray_modify(hwnd, active_icon(), "TrayClick — clicking ON");
+            unsafe {
+                let _ = SetTimer(Some(hwnd), ID_BLINK_TIMER, BLINK_MS, None);
+            }
+        } else {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), ID_BLINK_TIMER);
+            }
+            BLINK_NORMAL_SHOWN.store(true, Ordering::SeqCst);
+            tray_modify(hwnd, app_icon(), "TrayClick");
+        }
+    }
+
     // ---------- tray menu ----------
 
     fn show_menu(hwnd: HWND) {
@@ -448,6 +526,7 @@ mod win {
         }
         // Stop any clicking in progress so stray clicks can't hit the dialog.
         lock_engine().clicking = false;
+        refresh_indicator(parent);
         unsafe {
             let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
             static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -597,6 +676,7 @@ mod win {
         }
         // Stop any clicking in progress so stray clicks can't hit the dialog.
         lock_engine().clicking = false;
+        refresh_indicator(parent);
         unsafe {
             let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
             static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -739,6 +819,7 @@ mod win {
         let taskbar_msg = TASKBAR_CREATED_MSG.load(Ordering::SeqCst);
         if taskbar_msg != 0 && msg == taskbar_msg {
             tray_add(hwnd);
+            refresh_indicator(hwnd);
             return LRESULT(0);
         }
         match msg {
@@ -751,12 +832,31 @@ mod win {
             }
             m if m == WM_APP_TOGGLE => {
                 lock_engine().press_keybind();
+                refresh_indicator(hwnd);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == ID_BLINK_TIMER => {
+                if lock_engine().is_clicking_now() {
+                    // Alternate normal <-> active icon.
+                    let show_normal = !BLINK_NORMAL_SHOWN.load(Ordering::SeqCst);
+                    BLINK_NORMAL_SHOWN.store(show_normal, Ordering::SeqCst);
+                    let icon = if show_normal {
+                        app_icon()
+                    } else {
+                        active_icon()
+                    };
+                    tray_modify(hwnd, icon, "TrayClick — clicking ON");
+                } else {
+                    // State changed without a refresh; settle the icon.
+                    refresh_indicator(hwnd);
+                }
                 LRESULT(0)
             }
             WM_COMMAND => {
                 match wparam.0 & 0xFFFF {
                     ID_PAUSE_RESUME => {
                         lock_engine().toggle_pause();
+                        refresh_indicator(hwnd);
                     }
                     ID_SET_KEYBIND => open_capture_window(hwnd),
                     ID_SET_INTERVAL => open_interval_window(hwnd),
