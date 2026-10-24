@@ -46,4 +46,4 @@ Name: "{group}\TrayClick"; Filename: "{app}\trayclick.exe"
 Name: "{group}\Uninstall TrayClick"; Filename: "{uninstallexe}"
 
 [Run]
-Filename: "{app}\trayclick.exe"; Description: "Launch TrayClick now"; Flags: nowait postinstall skipifsilent unchecked
+Filename: "{app}\trayclick.exe"; Description: "Launch TrayClick now"; Flags: nowait postinstall skipifsilent
