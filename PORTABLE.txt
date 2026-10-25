@@ -1,0 +1,15 @@
+TrayClick - portable build
+
+Run the portable exe from anywhere; nothing is installed and no
+admin rights are needed. Your settings live in
+%APPDATA%\TrayClick\config.json and are shared with the installed
+build, so you can switch between them freely.
+
+To remove TrayClick, quit it from the tray menu and delete the exe
+(delete the settings folder too if you want a clean slate). If you
+turned on "Start with Windows" for the portable exe, turn it off
+first (or toggle it once after moving the exe) so the sign-in entry
+keeps pointing at the right place.
+
+The build is unsigned, so Windows SmartScreen may warn on first
+run: choose "More info" -> "Run anyway".

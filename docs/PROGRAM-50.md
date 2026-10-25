@@ -52,14 +52,14 @@ Standing constraints for every slice:
 17. Crosshair picker — next click anywhere becomes the lock point. *(Slice 3)*
 
 ### Triggers & automation
-18. Momentary mode — click only while keybind held. *(Slice 4)*
-19. Mouse side buttons (X1/X2) allowed as keybind. *(Slice 4)*
-20. Separate stop-only key. *(Slice 4)*
-21. RegisterHotKey option (near-zero idle CPU; polling stays default). *(Slice 4)*
-22. Delayed start — start in N minutes. *(Slice 4)*
-23. Foreground-app rule — run only while a chosen app is foreground. *(Slice 4)*
-24. Fullscreen auto-pause. *(Slice 4)*
-25. Command-line control — --start/--stop/--toggle/--profile forwarded to the running instance. *(Slice 4)*
+18. Momentary mode — click only while keybind held. *(Slice 4 — Done in v0.9.0)*
+19. Mouse side buttons (X1/X2) allowed as keybind. *(Slice 4 — Done in v0.9.0)*
+20. Separate stop-only key. *(Slice 4 — Done in v0.9.0)*
+21. RegisterHotKey option (near-zero idle CPU; polling stays default). *(Slice 4 — Done in v0.9.0)*
+22. Delayed start — start in N minutes. *(Slice 4 — Done in v0.9.0)*
+23. Foreground-app rule — run only while a chosen app is foreground. *(Slice 4 — Done in v0.9.0)*
+24. Fullscreen auto-pause. *(Slice 4 — Done in v0.9.0)*
+25. Command-line control — --start/--stop/--toggle/--profile forwarded to the running instance. *(Slice 4 — Done in v0.9.0)*
 
 ### Safety & limits
 26. Time limit per run (minutes). *(Slice 5)*
@@ -100,3 +100,7 @@ Standing constraints for every slice:
 - 2026-10-25 — **Slice 1 DONE (v0.6.0):** items 46 (PerMonitorV2 DPI awareness at startup), 1 (Double action), 5 (Burst 1–100 × gap 1–1000 ms, early-stop on toggle/failsafe/limit; limit counts physical clicks), 7 (button-down time 0–1000 ms), 9 (alternating buttons, lib `effective_button`). Config gains action/burst_clicks/burst_gap_ms/press_ms/alternate, all defaulted for older files. Gate: fmt + clippy both targets clean, 37/37 tests.
 - 2026-10-25 — **Slice 2 DONE (v0.7.0):** items 2 (Scroll action, −10..+10 notches, lock-aware), 3 (Key action; repeat key captured via the shared capture window, `CAPTURE_FOR`), 4 (Drag action; two points captured on a full-screen overlay; a started drag always releases), 6 (random interval range [base, max]), 8 (speed ramp, lib `ramped_interval_ms`; ramp wins over random, jitter last). Hold mode now explicitly gated to click actions (`is_click_action`). Config gains scroll_amount/repeat_vk/drag_ax..by/drag_set/random_interval/interval_max_ms/ramp/ramp_to_ms/ramp_seconds, all defaulted for older files. Gate: fmt + clippy both targets clean, 42/42 tests. Also: the release workflow gains the standing release-zip (installer + portable + SHA256SUMS in one zip) per SEAN's 2026-10-25 all-projects rule.
 - 2026-10-25 — **Slice 3 DONE (v0.8.0):** items 10 (multi-point sequence — up to 4 points rotated per cycle, captured on the crosshair overlay), 11 (three named target slots; names sanitized to a JSON-safe charset), 12 (click offset −200..200 px on each axis, applies to cursor and fixed points), 13 (pixel check — cycles act only while the pixel at the cycle's point matches the sampled colour within a 0–64 per-channel tolerance; blocked cycles are skipped, not counted), 14 (region guard — 8×8 pixel signature around the point sampled at run start; the run stops when more than a quarter of samples change; Follow mode anchors the patch at the run-start cursor), 15 (window-relative lock — the picked window is matched live, never persisted; its death falls back to the absolute point), 16 (other-monitor centre preset, lib `other_monitor_centre`), 17 (crosshair picker — one click sets the persistent lock point; the pre-0.8 capture-at-activation remains as the fallback when no point is set), 49 partial (settings window paged into Clicking / Action / Targeting tabs, remembers its page; position memory stays in Slice 7). The target is now three-way (`TargetMode` in lib; the config's `lock_position` boolean is still written, derived, for older builds). Config gains target/lock_x/y/set/lock_rel/rx/ry/seq_*/slot_*/offset_*/pixel_*/region_guard, all defaulted for older files. Gate: fmt + clippy (host + windows-msvc, -D warnings) clean, 49/49 tests.
+
+## Status log
+
+- 2026-10-25 — Slice 4 shipped as v0.9.0: items 18–25 (momentary mode, X1/X2 keybinds, stop-only key, RegisterHotKey option, delayed start, foreground-app rule, fullscreen auto-pause, CLI control incl. --profile forwarding). 26 of 50 items done. Release shape changed with this version per SEAN's clarified standing rule: exactly two assets (loose installer exe + portable zip).

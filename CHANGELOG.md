@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0 — 2026-10-25
+
+Slice 4 of the 50-enhancement program (docs/PROGRAM-50.md): triggers & automation, all on the settings window's Clicking tab (which grew a little taller).
+
+- **Momentary mode (item 18).** The mode control now cycles three ways — Click, Hold, Momentary. In Momentary, clicking runs only while the keybind is physically held; letting go stops it. (Momentary always polls the key — it needs the release — so the Hotkeys option below never applies to it.)
+- **Mouse side buttons as keys (item 19).** The keybind and the stop key can now be the mouse side buttons X1/X2, captured in the same capture window by pressing them. Left/Right/Middle stay unassignable. The Key action's repeat key still must be a keyboard key (it is synthesized as one).
+- **Stop-only key (item 20).** A second binding that only stops: press it and clicking stops, whatever started it. Set it from the Clicking tab via the same capture window; it is shown in Credits. (To un-set it, set `stop_vk` to 0 in config.json.)
+- **RegisterHotKey option (item 21).** "Hotkeys: On" registers the keybind and stop key as system hotkeys instead of polling them every 8 ms — near-zero idle CPU. Polling stays the default, and stays in charge whenever a hotkey can't be registered (another app owns the key), for mouse-button bindings, and in Momentary mode.
+- **Delayed start (item 22).** Type minutes (1–1440) and press "Start timer": clicking begins when the countdown ends (it clears a pause, like a start should). Pressing the button again cancels; starting a run any other way cancels it too. One-shot — never saved, never survives a restart.
+- **Foreground-app rule (item 23).** "Pick app..." lists your running windows; cycles then run only while that app is in the foreground (the held button releases while it isn't and presses again when it is). A process whose name Windows won't disclose can't be matched. The rule's app shows in Credits.
+- **Fullscreen auto-pause (item 24).** With this on, cycles pause while a fullscreen window is in the foreground and resume when it isn't — clickers and games stop fighting. The rule and the pause share one "run gate", sampled ten times a second.
+- **Command-line control (item 25).** Launching TrayClick with `--start`, `--stop`, or `--toggle` forwards the command to the running copy and exits; with no copy running, `--start`/`--toggle` launch it already clicking. `--profile <name>` forwards a profile name the same way — profiles themselves arrive in v1.0.0, so today the name is accepted and remembered, and switches nothing yet.
+
+Release shape (per SEAN's clarified standing rule): releases now carry exactly two assets — the installer exe, loose, and a zip holding the portable build (portable exe + LICENSE + PORTABLE.txt). Verify-labelled: all runtime behaviour on a real Windows machine remains for the field test.
+
 ## 0.8.0 — 2026-10-25
 
 Slice 3 of the 50-enhancement program (docs/PROGRAM-50.md): targeting. The settings window is now paged — **Clicking**, **Action**, and **Targeting** tabs (it remembers which tab you left it on) — and the Target control cycles three ways: Follow, Locked, Sequence.

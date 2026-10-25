@@ -49,6 +49,17 @@
 //! Interval window is paged (Clicking / Action / Targeting tabs) and
 //! remembers its page.
 //!
+//! The 0.9.0 slice is triggers and automation. The mode gains
+//! Momentary (click only while the keybind is held); the mouse side
+//! buttons X1/X2 can be the keybind or the new stop-only key; an
+//! optional RegisterHotKey mode replaces polling where it can
+//! (keyboard bindings only, never for momentary); a delayed start
+//! begins a run in N minutes; a run gate pauses cycles while the
+//! chosen foreground app is not in front, or while a fullscreen
+//! window is; and a second launch can forward --start, --stop,
+//! --toggle, or --profile <name> to the running instance instead of
+//! starting a copy.
+//!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
 //! indefinitely, until the keybind is pressed again. While clicking is
@@ -80,37 +91,45 @@ mod win {
     use trayclick::{
         absolute_coord, colour_matches, effective_button, format_count, ico_image_for_size,
         in_failsafe_corner, is_extended_key, is_valid_burst_clicks, is_valid_burst_gap,
-        is_valid_interval, is_valid_keybind, is_valid_limit, is_valid_offset, is_valid_pixel_tol,
-        is_valid_press_ms, is_valid_ramp_seconds, is_valid_scroll_amount, jittered_interval_ms,
-        key_name, next_click_deadline, other_monitor_centre, ramped_interval_ms, region_changed,
-        sanitize_slot_name, ClickAction, ClickButton, ClickMode, Config, Engine, KeyPressDetector,
-        TargetMode, DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        is_valid_delay_minutes, is_valid_interval, is_valid_keybind, is_valid_limit,
+        is_valid_offset, is_valid_pixel_tol, is_valid_press_ms, is_valid_ramp_seconds,
+        is_valid_repeat_key, is_valid_scroll_amount, jittered_interval_ms, key_name,
+        next_click_deadline, other_monitor_centre, parse_cli, ramped_interval_ms,
+        rect_is_fullscreen, region_changed, sanitize_slot_name, CliCommand, ClickAction,
+        ClickButton, ClickMode, Config, Engine, KeyPressDetector, KeyReleaseDetector, TargetMode,
+        DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
-    use windows::core::{w, PCWSTR};
+    use windows::core::{w, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT,
-        RECT, WPARAM,
+        CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LPARAM,
+        LRESULT, POINT, RECT, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
-        CreateSolidBrush, EnumDisplayMonitors, GetDC, GetPixel, ReleaseDC, SetBkMode, SetTextColor,
-        HBRUSH, HDC, HMONITOR, TRANSPARENT,
+        CreateSolidBrush, EnumDisplayMonitors, GetDC, GetMonitorInfoW, GetPixel, MonitorFromWindow,
+        ReleaseDC, SetBkMode, SetTextColor, HBRUSH, HDC, HMONITOR, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
         HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE,
     };
-    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::System::Threading::{
+        CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-        MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+        GetAsyncKeyState, RegisterHotKey, SendInput, SetFocus, UnregisterHotKey, INPUT, INPUT_0,
+        INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, MOD_NOREPEAT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+        MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -129,6 +148,22 @@ mod win {
     const WM_APP_LIMIT: u32 = WM_APP + 3;
     /// Posted by the click thread when the region guard stops a run.
     const WM_APP_REGION: u32 = WM_APP + 4;
+    /// Posted when the stop-only key is pressed (poll thread or the
+    /// CLI forwarder): stop clicking, whatever started it.
+    const WM_APP_STOP: u32 = WM_APP + 5;
+    /// Posted by a second launch carrying a CLI command; `wparam` is
+    /// 1 = start, 2 = stop, 3 = toggle.
+    const WM_APP_COMMAND: u32 = WM_APP + 6;
+    /// Posted when the run gate (foreground-app rule / fullscreen
+    /// pause) flips, so the UI thread can settle the held button.
+    const WM_APP_GATE: u32 = WM_APP + 7;
+    /// Posted after a capture assigns a key, to (re)register hotkeys.
+    const WM_APP_REHOTKEY: u32 = WM_APP + 8;
+    /// The delayed-start countdown timer on the main window.
+    const ID_DELAY_TIMER: usize = 2;
+    /// RegisterHotKey ids (their own numbering space).
+    const ID_HOTKEY_KEYBIND: i32 = 1;
+    const ID_HOTKEY_STOP: i32 = 2;
 
     const TRAY_ID: u32 = 1;
 
@@ -203,6 +238,18 @@ mod win {
     const ID_IV_TOL_EDIT: usize = 2127;
     const ID_IV_TOL_SET: usize = 2128;
     const ID_IV_FOOTER: usize = 2129;
+    // Clicking-page trigger controls (0.9.0).
+    const ID_IV_STOPKEY: usize = 2130;
+    const ID_IV_HOTKEY: usize = 2131;
+    const ID_IV_DELAY_EDIT: usize = 2132;
+    const ID_IV_DELAY: usize = 2133;
+    const ID_IV_FS: usize = 2134;
+    const ID_IV_FG: usize = 2135;
+    const ID_IV_FG_LABEL: usize = 2136;
+    const ID_IV_FG_PICK: usize = 2137;
+    // App-picker window controls (0.9.0).
+    const ID_AP_LIST: usize = 3001;
+    const ID_AP_SELECT: usize = 3002;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
@@ -286,6 +333,28 @@ mod win {
     /// 2 = Targeting) and its paged controls' handles.
     static CURRENT_PAGE: AtomicU32 = AtomicU32::new(0);
     static PAGE_CONTROLS: OnceLock<Mutex<Vec<(i32, u32)>>> = OnceLock::new();
+    /// The stop-only key's virtual-key code (0 = unset), and whether
+    /// RegisterHotKey mode is on. The OK flags record which bindings
+    /// are actually registered right now (registration can fail, and
+    /// mouse buttons can't register at all — those keep polling).
+    static STOP_VK: AtomicU32 = AtomicU32::new(0);
+    static HOTKEY_MODE: AtomicBool = AtomicBool::new(false);
+    static KB_HOTKEY_OK: AtomicBool = AtomicBool::new(false);
+    static STOP_HOTKEY_OK: AtomicBool = AtomicBool::new(false);
+    /// The run gate: cycles and the held button are live only while
+    /// this is open. The click thread recomputes it from the
+    /// foreground-app rule and the fullscreen pause.
+    static GATE_OPEN: AtomicBool = AtomicBool::new(true);
+    static FG_RULE: AtomicBool = AtomicBool::new(false);
+    static FG_EXE: OnceLock<Mutex<String>> = OnceLock::new();
+    static FS_PAUSE: AtomicBool = AtomicBool::new(false);
+    /// When a delayed start fires (one-shot, never persisted).
+    static DELAY_END: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    /// A profile name forwarded by a CLI launch. Profiles land in
+    /// v1.0.0; until then the name is only remembered here.
+    static PENDING_PROFILE: OnceLock<Mutex<String>> = OnceLock::new();
+    /// The app picker's process names, parallel to its listbox rows.
+    static APP_PICK_EXES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     /// Auto-stop limit in clicks per run; 0 = no limit.
     static LIMIT_CLICKS: AtomicU32 = AtomicU32::new(0);
     /// Clicks sent in the current run (reset on every activation).
@@ -417,12 +486,14 @@ mod win {
         match m {
             ClickMode::Click => 0,
             ClickMode::Hold => 1,
+            ClickMode::Momentary => 2,
         }
     }
 
     fn current_mode() -> ClickMode {
         match MODE.load(Ordering::SeqCst) {
             1 => ClickMode::Hold,
+            2 => ClickMode::Momentary,
             _ => ClickMode::Click,
         }
     }
@@ -467,6 +538,22 @@ mod win {
 
     fn slot_names() -> &'static Mutex<[String; 3]> {
         SLOT_NAMES.get_or_init(|| Mutex::new([String::new(), String::new(), String::new()]))
+    }
+
+    fn fg_exe() -> &'static Mutex<String> {
+        FG_EXE.get_or_init(|| Mutex::new(String::new()))
+    }
+
+    fn delay_end() -> &'static Mutex<Option<Instant>> {
+        DELAY_END.get_or_init(|| Mutex::new(None))
+    }
+
+    fn pending_profile() -> &'static Mutex<String> {
+        PENDING_PROFILE.get_or_init(|| Mutex::new(String::new()))
+    }
+
+    fn app_pick_exes() -> &'static Mutex<Vec<String>> {
+        APP_PICK_EXES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn region_base() -> &'static Mutex<Option<[u32; 64]>> {
@@ -529,6 +616,14 @@ mod win {
             pixel_rgb: PIXEL_RGB.load(Ordering::SeqCst),
             pixel_tol: PIXEL_TOL.load(Ordering::SeqCst),
             region_guard: REGION_GUARD.load(Ordering::SeqCst),
+            stop_vk: STOP_VK.load(Ordering::SeqCst),
+            hotkey_mode: HOTKEY_MODE.load(Ordering::SeqCst),
+            fg_rule: FG_RULE.load(Ordering::SeqCst),
+            fg_exe: fg_exe()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            fs_pause: FS_PAUSE.load(Ordering::SeqCst),
         }
     }
 
@@ -1050,6 +1145,125 @@ mod win {
         }
     }
 
+    fn main_hwnd() -> Option<HWND> {
+        let raw = MAIN_HWND.load(Ordering::SeqCst);
+        if raw != 0 {
+            Some(HWND(raw as isize as *mut c_void))
+        } else {
+            None
+        }
+    }
+
+    /// Cancel a pending delayed start, if one is armed.
+    fn cancel_delay() {
+        let was = delay_end()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if was.is_some() {
+            if let Some(hwnd) = main_hwnd() {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), ID_DELAY_TIMER);
+                }
+            }
+        }
+    }
+
+    /// Side effects shared by every path that starts a run: reset
+    /// the per-run counters, cancel any pending delayed start, and
+    /// arm the locked-target fallback point when one is needed.
+    fn on_run_started() {
+        RUN_COUNT.store(0, Ordering::Relaxed);
+        SEQ_IDX.store(0, Ordering::SeqCst);
+        RUN_SET.store(false, Ordering::SeqCst);
+        cancel_delay();
+        // A Locked run with no persistent point falls back to the
+        // position where it was started (not in Hold mode, which
+        // never uses a point).
+        if current_mode() != ClickMode::Hold
+            && target_mode() == TargetMode::Locked
+            && !LOCK_SET.load(Ordering::SeqCst)
+        {
+            capture_lock_point();
+        }
+    }
+
+    /// One press of the toggle keybind (from the poll thread's
+    /// message, a registered hotkey, or the CLI toggle command).
+    fn handle_keybind_press(hwnd: HWND) {
+        if current_mode() == ClickMode::Momentary {
+            // Momentary never toggles off on a press; the release
+            // of the key is what stops it.
+            if !lock_engine().is_clicking_now() {
+                lock_engine().clicking = true;
+                on_run_started();
+            }
+        } else {
+            lock_engine().press_keybind();
+            if lock_engine().is_clicking_now() {
+                on_run_started();
+            } else {
+                RUN_SET.store(false, Ordering::SeqCst);
+            }
+        }
+        refresh_indicator(hwnd);
+    }
+
+    /// Stop clicking, whatever started it (stop key, CLI --stop).
+    fn engine_stop(hwnd: HWND) {
+        lock_engine().clicking = false;
+        RUN_SET.store(false, Ordering::SeqCst);
+        refresh_indicator(hwnd);
+    }
+
+    /// Start clicking unconditionally (CLI --start, delayed start):
+    /// clears a pause as well as starting.
+    fn engine_start(hwnd: HWND) {
+        let started = {
+            let mut e = lock_engine();
+            e.paused = false;
+            if !e.clicking {
+                e.clicking = true;
+                true
+            } else {
+                false
+            }
+        };
+        if started {
+            on_run_started();
+        }
+        refresh_indicator(hwnd);
+    }
+
+    /// (Re)register the system hotkeys from the current bindings.
+    /// Mouse-button bindings cannot be hotkeys (they keep polling),
+    /// and a failed registration falls back to polling too — the OK
+    /// flags record what is actually live, and the poll thread reads
+    /// them every iteration.
+    fn register_hotkeys(hwnd: HWND) {
+        unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), ID_HOTKEY_KEYBIND);
+            let _ = UnregisterHotKey(Some(hwnd), ID_HOTKEY_STOP);
+        }
+        KB_HOTKEY_OK.store(false, Ordering::SeqCst);
+        STOP_HOTKEY_OK.store(false, Ordering::SeqCst);
+        if !HOTKEY_MODE.load(Ordering::SeqCst) {
+            return;
+        }
+        let kb = KEYBIND_VK.load(Ordering::SeqCst);
+        if kb >= 0x08 {
+            let ok =
+                unsafe { RegisterHotKey(Some(hwnd), ID_HOTKEY_KEYBIND, MOD_NOREPEAT, kb).is_ok() };
+            KB_HOTKEY_OK.store(ok, Ordering::SeqCst);
+        }
+        let sv = STOP_VK.load(Ordering::SeqCst);
+        if sv != 0 && sv >= 0x08 {
+            let ok =
+                unsafe { RegisterHotKey(Some(hwnd), ID_HOTKEY_STOP, MOD_NOREPEAT, sv).is_ok() };
+            STOP_HOTKEY_OK.store(ok, Ordering::SeqCst);
+        }
+    }
+
     /// Capture the cursor as this run's fallback lock point (used
     /// for a Locked run when no persistent lock point is set).
     fn capture_lock_point() {
@@ -1077,7 +1291,8 @@ mod win {
         // Scroll, Key, or Drag action the engine simply repeats cycles.
         let want = lock_engine().is_clicking_now()
             && current_mode() == ClickMode::Hold
-            && current_action().is_click_action();
+            && current_action().is_click_action()
+            && GATE_OPEN.load(Ordering::SeqCst);
         let held = HELD.load(Ordering::SeqCst);
         if want && !held {
             send_button(true);
@@ -1208,6 +1423,100 @@ mod win {
         }
     }
 
+    /// The foreground window's process image name (basename) and
+    /// whether the window covers its whole monitor. `(None, false)`
+    /// when there is no ordinary foreground window — the desktop
+    /// shell or one of TrayClick's own windows; a process whose name
+    /// cannot be read also reports `None`.
+    /// A process's image name (basename, e.g. `game.exe`), or
+    /// `None` when it cannot be read (protected processes).
+    fn process_exe_name(pid: u32) -> Option<String> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 260];
+            let mut len = buf.len() as u32;
+            let r = QueryFullProcessImageNameW(
+                h,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            );
+            let _ = CloseHandle(h);
+            r.ok()?;
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            path.rsplit(['\\', '/']).next().map(|s| s.to_string())
+        }
+    }
+
+    fn foreground_info() -> (Option<String>, bool) {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.is_invalid() || fg == GetShellWindow() {
+                return (None, false);
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            if pid == 0 || pid == std::process::id() {
+                return (None, false);
+            }
+            let name = process_exe_name(pid);
+            let mut fullscreen = false;
+            let mut rc = RECT::default();
+            if GetWindowRect(fg, &mut rc).is_ok() {
+                let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                    let m = mi.rcMonitor;
+                    fullscreen = rect_is_fullscreen(
+                        (rc.left, rc.top, rc.right, rc.bottom),
+                        (m.left, m.top, m.right, m.bottom),
+                    );
+                }
+            }
+            (name, fullscreen)
+        }
+    }
+
+    /// Whether the run gate should be open right now: the
+    /// foreground-app rule (when on and an app is picked) requires
+    /// that app in the foreground, and the fullscreen pause (when
+    /// on) closes the gate while a fullscreen window is foreground.
+    /// A foreground process whose name can't be read counts as "not
+    /// the app" — such apps can't be matched by the rule.
+    fn gate_should_be_open() -> bool {
+        let fg_rule = FG_RULE.load(Ordering::SeqCst);
+        let fs_pause = FS_PAUSE.load(Ordering::SeqCst);
+        if !fg_rule && !fs_pause {
+            return true;
+        }
+        let want = if fg_rule {
+            fg_exe()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        } else {
+            String::new()
+        };
+        let matching = fg_rule && !want.is_empty();
+        if !matching && !fs_pause {
+            return true;
+        }
+        let (exe, fullscreen) = foreground_info();
+        if matching {
+            match exe {
+                Some(e) if e.eq_ignore_ascii_case(&want) => {}
+                _ => return false,
+            }
+        }
+        if fs_pause && fullscreen {
+            return false;
+        }
+        true
+    }
+
     fn clicker_thread() {
         // Clicks are scheduled on absolute deadlines (see
         // `next_click_deadline`), so the time a click itself takes does
@@ -1220,7 +1529,19 @@ mod win {
         let mut rng = XorShift(seed);
         let mut deadline: Option<Instant> = None;
         let mut run_start: Option<Instant> = None;
+        let mut last_gate = Instant::now() - Duration::from_millis(200);
         loop {
+            // Sample the run gate (foreground-app rule + fullscreen
+            // pause) at most every 100 ms, whatever the engine state,
+            // so flips are noticed mid-run and mid-idle alike.
+            if last_gate.elapsed() >= Duration::from_millis(100) {
+                last_gate = Instant::now();
+                let open = gate_should_be_open();
+                if open != GATE_OPEN.load(Ordering::SeqCst) {
+                    GATE_OPEN.store(open, Ordering::SeqCst);
+                    post_main(WM_APP_GATE);
+                }
+            }
             if !lock_engine().is_clicking_now() {
                 deadline = None;
                 run_start = None;
@@ -1254,12 +1575,16 @@ mod win {
                     if run_start.is_none() {
                         run_start = Some(Instant::now());
                     }
-                    run_cycle();
+                    if GATE_OPEN.load(Ordering::SeqCst) {
+                        run_cycle();
+                    }
                     deadline = Some(Instant::now() + effective_interval(&mut rng, run_start));
                 }
                 Some(d) => {
                     if Instant::now() >= d {
-                        run_cycle();
+                        if GATE_OPEN.load(Ordering::SeqCst) {
+                            run_cycle();
+                        }
                         deadline = Some(next_click_deadline(
                             d,
                             effective_interval(&mut rng, run_start),
@@ -1279,19 +1604,49 @@ mod win {
     }
 
     fn keybind_thread() {
-        let mut detector = KeyPressDetector::new();
+        let mut kb_press = KeyPressDetector::new();
+        let mut kb_release = KeyReleaseDetector::new();
+        let mut stop_press = KeyPressDetector::new();
         loop {
             std::thread::sleep(Duration::from_millis(8));
             if DIALOG_OPEN.load(Ordering::SeqCst) {
                 continue;
             }
             if RESYNC_DETECTOR.swap(false, Ordering::SeqCst) {
-                detector.resync();
+                kb_press.resync();
+                kb_release.resync();
+                stop_press.resync();
             }
-            let vk = KEYBIND_VK.load(Ordering::SeqCst) as i32;
-            let down = unsafe { GetAsyncKeyState(vk) } & (0x8000u16 as i16) != 0;
-            if detector.sample(down) {
-                post_main(WM_APP_TOGGLE);
+            let down_of = |vk: u32| {
+                let st = unsafe { GetAsyncKeyState(vk as i32) };
+                st & (0x8000u16 as i16) != 0
+            };
+            // The keybind. While a registered hotkey delivers it,
+            // polling stands down — except in momentary mode, which
+            // needs the release edge only polling can see (hotkey
+            // mode therefore never engages for momentary).
+            let kb_vk = KEYBIND_VK.load(Ordering::SeqCst);
+            let kb_via_hotkey = HOTKEY_MODE.load(Ordering::SeqCst)
+                && KB_HOTKEY_OK.load(Ordering::SeqCst)
+                && current_mode() != ClickMode::Momentary;
+            if !kb_via_hotkey {
+                let down = down_of(kb_vk);
+                if kb_press.sample(down) {
+                    post_main(WM_APP_TOGGLE);
+                }
+                if current_mode() == ClickMode::Momentary && kb_release.sample(down) {
+                    post_main(WM_APP_STOP);
+                }
+            }
+            // The stop-only key (unset = 0 = skipped). A registered
+            // hotkey delivers it when there is one.
+            let stop_vk = STOP_VK.load(Ordering::SeqCst);
+            if stop_vk != 0 {
+                let stop_via_hotkey =
+                    HOTKEY_MODE.load(Ordering::SeqCst) && STOP_HOTKEY_OK.load(Ordering::SeqCst);
+                if !stop_via_hotkey && stop_press.sample(down_of(stop_vk)) {
+                    post_main(WM_APP_STOP);
+                }
             }
         }
     }
@@ -1593,16 +1948,31 @@ mod win {
             }
             TargetMode::Follow => "Follow cursor".to_string(),
         };
+        let stop_vk = STOP_VK.load(Ordering::SeqCst);
+        let stop = if stop_vk == 0 {
+            "not set".to_string()
+        } else {
+            key_name(stop_vk)
+        };
+        let mut rules = String::new();
+        if FG_RULE.load(Ordering::SeqCst) {
+            let exe = fg_label_caption();
+            rules.push_str(&format!("\r\n{exe}"));
+        }
+        if FS_PAUSE.load(Ordering::SeqCst) {
+            rules.push_str("\r\nFullscreen pause: on");
+        }
         let text = wide(&format!(
             "TrayClick {}\r\n\r\n\
              Created by SEAN (SeanShaffer88).\r\n\
              Built with Rust and the Windows API.\r\n\r\n\
              Keybind: {keybind} — start or stop auto clicking at the cursor.\r\n\
+             Stop key: {stop}\r\n\
              Interval: {interval} ms (set it from the tray menu).\r\n\
              Button: {button}\r\n\
              Mode: {mode}\r\n\
              Action: {action}\r\n\
-             Target: {target}\r\n\
+             Target: {target}{rules}\r\n\
              Jitter: {jitter}\r\n\
              Clicks this session: {clicks}\r\n\r\n\
              Safety: while clicking, slam the mouse into the top-left corner\
@@ -1645,15 +2015,19 @@ mod win {
         match msg {
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = wparam.0 as u32;
-                if vk == VK_ESCAPE_CODE {
+                if vk == VK_ESCAPE_CODE || assign_capture_key(hwnd, vk) {
                     let _ = DestroyWindow(hwnd);
-                } else if is_valid_keybind(vk) {
-                    if CAPTURE_FOR.load(Ordering::SeqCst) == 1 {
-                        REPEAT_VK.store(vk, Ordering::SeqCst);
-                    } else {
-                        KEYBIND_VK.store(vk, Ordering::SeqCst);
-                    }
-                    save_config(current_config());
+                }
+                LRESULT(0)
+            }
+            WM_XBUTTONDOWN => {
+                // Mouse side buttons can be the keybind or the stop
+                // key (never the repeat key — it must be sendable as
+                // a keyboard event). GET_XBUTTON_WPARAM: 1 = X1,
+                // 2 = X2, mapping to VK 0x05 / 0x06.
+                let xb = (wparam.0 >> 16) & 0xFFFF;
+                let vk = 0x04 + xb as u32;
+                if (vk == 0x05 || vk == 0x06) && assign_capture_key(hwnd, vk) {
                     let _ = DestroyWindow(hwnd);
                 }
                 LRESULT(0)
@@ -1673,25 +2047,56 @@ mod win {
                 // The assigning keypress is still physically held; make
                 // the poll thread treat it as the baseline, not a press.
                 RESYNC_DETECTOR.store(true, Ordering::SeqCst);
+                // A new assignment may change what needs registering.
+                post_main(WM_APP_REHOTKEY);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
 
-    fn open_capture_window(parent: HWND) {
-        open_capture(parent, false);
+    /// Assign a captured key to the capture window's current target
+    /// (0 = keybind, 1 = repeat key, 2 = stop key), when the key is
+    /// valid for that target. Returns whether it assigned.
+    fn assign_capture_key(_hwnd: HWND, vk: u32) -> bool {
+        match CAPTURE_FOR.load(Ordering::SeqCst) {
+            1 => {
+                if !is_valid_repeat_key(vk) {
+                    return false;
+                }
+                REPEAT_VK.store(vk, Ordering::SeqCst);
+            }
+            2 => {
+                if !is_valid_keybind(vk) {
+                    return false;
+                }
+                STOP_VK.store(vk, Ordering::SeqCst);
+            }
+            _ => {
+                if !is_valid_keybind(vk) {
+                    return false;
+                }
+                KEYBIND_VK.store(vk, Ordering::SeqCst);
+            }
+        }
+        save_config(current_config());
+        true
     }
 
-    /// Open the key capture window. With `for_repeat` it assigns the
-    /// Key action's repeat key instead of the toggle keybind; the
-    /// capture mechanics (and the resync-on-close that keeps the
-    /// assigning press from counting as a use) are identical.
-    fn open_capture(parent: HWND, for_repeat: bool) {
+    fn open_capture_window(parent: HWND) {
+        open_capture(parent, 0);
+    }
+
+    /// Open the key capture window for a target: 0 = the toggle
+    /// keybind, 1 = the Key action's repeat key, 2 = the stop-only
+    /// key. The capture mechanics (and the resync-on-close that
+    /// keeps the assigning press from counting as a use) are
+    /// identical for all three.
+    fn open_capture(parent: HWND, target: u32) {
         if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
             return; // already open
         }
-        CAPTURE_FOR.store(if for_repeat { 1 } else { 0 }, Ordering::SeqCst);
+        CAPTURE_FOR.store(target, Ordering::SeqCst);
         // Stop any clicking in progress so stray clicks can't hit the dialog.
         lock_engine().clicking = false;
         refresh_indicator(parent);
@@ -1714,10 +2119,10 @@ mod win {
             let height = 150;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
-            let title = wide(if for_repeat {
-                "TrayClick — Set Repeat Key"
-            } else {
-                "TrayClick — Set Keybind"
+            let title = wide(match target {
+                1 => "TrayClick — Set Repeat Key",
+                2 => "TrayClick — Set Stop Key",
+                _ => "TrayClick — Set Keybind",
             });
             let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -1739,18 +2144,23 @@ mod win {
                     return;
                 }
             };
-            let current = key_name(if for_repeat {
-                REPEAT_VK.load(Ordering::SeqCst)
-            } else {
-                KEYBIND_VK.load(Ordering::SeqCst)
+            let current = key_name(match target {
+                1 => REPEAT_VK.load(Ordering::SeqCst),
+                2 => STOP_VK.load(Ordering::SeqCst),
+                _ => KEYBIND_VK.load(Ordering::SeqCst),
             });
-            let what = if for_repeat {
-                "the key repeated by the Key action"
+            let what = match target {
+                1 => "the key repeated by the Key action",
+                2 => "the stop-only key",
+                _ => "the toggle keybind",
+            };
+            let hint = if target == 1 {
+                ""
             } else {
-                "the toggle keybind"
+                " A mouse side button works too."
             };
             let label = wide(&format!(
-                "Press a key to set {what}.\r\n\r\nCurrent: {current}\r\nEsc to cancel."
+                "Press a key to set {what}.{hint}\r\n\r\nCurrent: {current}\r\nEsc to cancel."
             ));
             let _ = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2261,6 +2671,12 @@ mod win {
                     ID_IV_POS => apply_pos(hwnd),
                     ID_IV_LIMIT_SET => apply_limit(hwnd),
                     ID_IV_LAUNCH => apply_launch(hwnd),
+                    ID_IV_STOPKEY => apply_stopkey(hwnd),
+                    ID_IV_HOTKEY => apply_hotkey(hwnd),
+                    ID_IV_DELAY => apply_delay(hwnd),
+                    ID_IV_FS => apply_fs(hwnd),
+                    ID_IV_FG => apply_fg(hwnd),
+                    ID_IV_FG_PICK => apply_fg_pick(hwnd),
                     ID_IV_ACTION => apply_action(hwnd),
                     ID_IV_ALT => apply_alt(hwnd),
                     ID_IV_NUM_SET => apply_numbers(hwnd),
@@ -2273,7 +2689,7 @@ mod win {
                         // repeat-key capture from the main window.
                         let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
                         let _ = DestroyWindow(hwnd);
-                        open_capture(parent, true);
+                        open_capture(parent, 1);
                     }
                     ID_IV_DRAG => {
                         let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
@@ -2357,6 +2773,64 @@ mod win {
         format!("Mode: {}", current_mode().label())
     }
 
+    fn stopkey_caption() -> String {
+        let vk = STOP_VK.load(Ordering::SeqCst);
+        if vk == 0 {
+            "Stop key: none".to_string()
+        } else {
+            format!("Stop key: {}", key_name(vk))
+        }
+    }
+
+    fn hotkey_caption() -> String {
+        if HOTKEY_MODE.load(Ordering::SeqCst) {
+            "Hotkeys: On".to_string()
+        } else {
+            "Hotkeys: Off".to_string()
+        }
+    }
+
+    fn delay_caption() -> String {
+        let end = *delay_end()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match end {
+            Some(end) => {
+                let secs = end.saturating_duration_since(Instant::now()).as_secs();
+                format!("Starts in ~{} min (cancel)", (secs / 60).max(1))
+            }
+            None => "Start timer".to_string(),
+        }
+    }
+
+    fn fs_caption() -> String {
+        if FS_PAUSE.load(Ordering::SeqCst) {
+            "Fullscreen pause: On".to_string()
+        } else {
+            "Fullscreen pause: Off".to_string()
+        }
+    }
+
+    fn fg_caption() -> String {
+        if FG_RULE.load(Ordering::SeqCst) {
+            "App rule: On".to_string()
+        } else {
+            "App rule: Off".to_string()
+        }
+    }
+
+    fn fg_label_caption() -> String {
+        let exe = fg_exe()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if exe.is_empty() {
+            "Foreground app: (none picked)".to_string()
+        } else {
+            format!("Foreground app: {exe}")
+        }
+    }
+
     fn pos_caption() -> String {
         format!("Target: {}", target_mode().label())
     }
@@ -2409,10 +2883,11 @@ mod win {
         }
     }
 
-    /// The settings window's outer height for a page (the Targeting
-    /// page is the tall one).
+    /// The settings window's outer height for a page (Clicking
+    /// carries the trigger controls, Targeting the targeting rows).
     fn page_outer_height(page: u32) -> i32 {
         match page {
+            0 => 560,
             2 => 580,
             _ => 420,
         }
@@ -2525,6 +3000,30 @@ mod win {
                 let t = wide(launch_caption());
                 let _ = SetWindowTextW(lb, PCWSTR(t.as_ptr()));
             }
+            if let Ok(sb) = GetDlgItem(Some(hwnd), ID_IV_STOPKEY as i32) {
+                let t = wide(&stopkey_caption());
+                let _ = SetWindowTextW(sb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(hb) = GetDlgItem(Some(hwnd), ID_IV_HOTKEY as i32) {
+                let t = wide(&hotkey_caption());
+                let _ = SetWindowTextW(hb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(db) = GetDlgItem(Some(hwnd), ID_IV_DELAY as i32) {
+                let t = wide(&delay_caption());
+                let _ = SetWindowTextW(db, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(fb) = GetDlgItem(Some(hwnd), ID_IV_FS as i32) {
+                let t = wide(&fs_caption());
+                let _ = SetWindowTextW(fb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(fb) = GetDlgItem(Some(hwnd), ID_IV_FG as i32) {
+                let t = wide(&fg_caption());
+                let _ = SetWindowTextW(fb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(fl) = GetDlgItem(Some(hwnd), ID_IV_FG_LABEL as i32) {
+                let t = wide(&fg_label_caption());
+                let _ = SetWindowTextW(fl, PCWSTR(t.as_ptr()));
+            }
             if let Ok(ab) = GetDlgItem(Some(hwnd), ID_IV_ACTION as i32) {
                 let t = wide(&action_caption());
                 let _ = SetWindowTextW(ab, PCWSTR(t.as_ptr()));
@@ -2620,7 +3119,8 @@ mod win {
     fn apply_mode(hwnd: HWND) {
         let next = match current_mode() {
             ClickMode::Click => ClickMode::Hold,
-            ClickMode::Hold => ClickMode::Click,
+            ClickMode::Hold => ClickMode::Momentary,
+            ClickMode::Momentary => ClickMode::Click,
         };
         MODE.store(mode_u32(next), Ordering::SeqCst);
         save_config(current_config());
@@ -2652,6 +3152,104 @@ mod win {
         relabel_interval_controls(hwnd);
         unsafe {
             let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Stop key: capture a key (or mouse side button) for it, using
+    /// the same capture window as the keybind.
+    fn apply_stopkey(hwnd: HWND) {
+        unsafe {
+            let parent = GetParent(hwnd).unwrap_or(hwnd);
+            let _ = DestroyWindow(hwnd);
+            open_capture(parent, 2);
+        }
+    }
+
+    fn apply_hotkey(hwnd: HWND) {
+        HOTKEY_MODE.fetch_not(Ordering::SeqCst);
+        save_config(current_config());
+        if let Some(main) = main_hwnd() {
+            register_hotkeys(main);
+        }
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Delayed start: arm the one-shot timer from the minutes edit,
+    /// or cancel it when one is already counting down.
+    fn apply_delay(hwnd: HWND) {
+        let armed = delay_end()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if armed {
+            cancel_delay();
+            relabel_interval_controls(hwnd);
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+            return;
+        }
+        let parsed = read_edit_u32(hwnd, ID_IV_DELAY_EDIT);
+        match parsed {
+            Some(mins) if is_valid_delay_minutes(mins) => {
+                *delay_end()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(Instant::now() + Duration::from_secs(u64::from(mins) * 60));
+                if let Some(main) = main_hwnd() {
+                    unsafe {
+                        let _ = SetTimer(
+                            Some(main),
+                            ID_DELAY_TIMER,
+                            mins.saturating_mul(60_000),
+                            None,
+                        );
+                    }
+                }
+                relabel_interval_controls(hwnd);
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+            _ => {
+                warn(
+                    hwnd,
+                    "Enter a delay of 1 to 1440 minutes (whole numbers only).",
+                );
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+        }
+    }
+
+    fn apply_fs(hwnd: HWND) {
+        FS_PAUSE.fetch_not(Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_fg(hwnd: HWND) {
+        FG_RULE.fetch_not(Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Pick the foreground-rule app from the running windows.
+    fn apply_fg_pick(hwnd: HWND) {
+        unsafe {
+            let parent = GetParent(hwnd).unwrap_or(hwnd);
+            let _ = DestroyWindow(hwnd);
+            open_app_picker(parent);
         }
     }
 
@@ -3051,6 +3649,215 @@ mod win {
         relabel_interval_controls(hwnd);
     }
 
+    // ---------- App picker (foreground-rule target) ----------
+
+    /// EnumWindows callback: collect (title, exe) for visible,
+    /// titled windows belonging to other processes.
+    unsafe extern "system" fn app_pick_enum(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<(String, String)>);
+        let keep = windows::core::BOOL(1);
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            return keep;
+        }
+        let len = unsafe { GetWindowTextLengthW(hwnd) };
+        if len <= 0 {
+            return keep;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == 0 || pid == std::process::id() {
+            return keep;
+        }
+        let mut tbuf = vec![0u16; len as usize + 1];
+        let n = unsafe { GetWindowTextW(hwnd, &mut tbuf) };
+        if n <= 0 {
+            return keep;
+        }
+        let title = String::from_utf16_lossy(&tbuf[..n as usize]);
+        if title == "Program Manager" {
+            return keep;
+        }
+        if let Some(exe) = process_exe_name(pid) {
+            out.push((title, exe));
+        }
+        keep
+    }
+
+    unsafe extern "system" fn app_pick_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        const LB_GETCURSEL: usize = 0x0188;
+        const LBN_DBLCLK: usize = 2;
+        match msg {
+            WM_COMMAND => {
+                let id = wparam.0 & 0xFFFF;
+                let code = (wparam.0 >> 16) & 0xFFFF;
+                if id == ID_AP_SELECT || (id == ID_AP_LIST && code == LBN_DBLCLK) {
+                    let list = GetDlgItem(Some(hwnd), ID_AP_LIST as i32).unwrap_or_default();
+                    let idx =
+                        SendMessageW(list, LB_GETCURSEL as u32, Some(WPARAM(0)), Some(LPARAM(0))).0;
+                    if idx >= 0 {
+                        let exes = app_pick_exes()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(exe) = exes.get(idx as usize) {
+                            *fg_exe()
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = exe.clone();
+                            FG_RULE.store(true, Ordering::SeqCst);
+                            save_config(current_config());
+                        }
+                    }
+                    let _ = DestroyWindow(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC => {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+                SetTextColor(hdc, COLORREF(0x00F2F2F2));
+                SetBkMode(hdc, TRANSPARENT);
+                LRESULT(dialog_bg_brush().0 as isize)
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                DIALOG_OPEN.store(false, Ordering::SeqCst);
+                RESYNC_DETECTOR.store(true, Ordering::SeqCst);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// List the running apps' windows; picking one sets it as the
+    /// foreground-rule app (and turns the rule on).
+    fn open_app_picker(parent: HWND) {
+        if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+            return; // already open
+        }
+        // Stop any clicking in progress so stray clicks can't hit it.
+        lock_engine().clicking = false;
+        refresh_indicator(parent);
+        unsafe {
+            let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+            static REGISTERED: AtomicBool = AtomicBool::new(false);
+            if !REGISTERED.swap(true, Ordering::SeqCst) {
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(app_pick_wndproc),
+                    hInstance: instance.into(),
+                    hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                    hbrBackground: CreateSolidBrush(COLORREF(0x00181818)),
+                    lpszClassName: w!("TrayClickAppPick"),
+                    ..Default::default()
+                };
+                RegisterClassW(&wc);
+            }
+            let mut found: Vec<(String, String)> = Vec::new();
+            let _ = EnumWindows(
+                Some(app_pick_enum),
+                LPARAM(&mut found as *mut Vec<(String, String)> as isize),
+            );
+            found.sort_by(|a, b| {
+                a.1.to_lowercase()
+                    .cmp(&b.1.to_lowercase())
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            found.dedup();
+            let width = 480;
+            let height = 400;
+            let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
+            let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+            let hwnd = match CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("TrayClickAppPick"),
+                w!("TrayClick — Pick Foreground App"),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                x,
+                y,
+                width,
+                height,
+                Some(parent),
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    DIALOG_OPEN.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            let label = wide("Pick the app the clicks should follow:");
+            let _ = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR(label.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                12,
+                10,
+                440,
+                20,
+                Some(hwnd),
+                None,
+                Some(instance.into()),
+                None,
+            );
+            // LISTBOX with LBS_NOTIFY (0x0001) + border + vscroll.
+            let list = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("LISTBOX"),
+                PCWSTR::null(),
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WINDOW_STYLE(0x0000_0001),
+                12,
+                36,
+                440,
+                288,
+                Some(hwnd),
+                Some(HMENU(ID_AP_LIST as *mut c_void)),
+                Some(instance.into()),
+                None,
+            );
+            const LB_ADDSTRING: usize = 0x0180;
+            let mut exes: Vec<String> = Vec::new();
+            if let Ok(list) = list {
+                for (title, exe) in &found {
+                    let row = wide(&format!("{title}  —  {exe}"));
+                    let _ = SendMessageW(
+                        list,
+                        LB_ADDSTRING as u32,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(row.as_ptr() as isize)),
+                    );
+                    exes.push(exe.clone());
+                }
+            }
+            *app_pick_exes()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = exes;
+            let _ = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                w!("Choose"),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                332,
+                330,
+                120,
+                30,
+                Some(hwnd),
+                Some(HMENU(ID_AP_SELECT as *mut c_void)),
+                Some(instance.into()),
+                None,
+            );
+        }
+    }
+
     fn open_interval_window(parent: HWND) {
         if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
             return; // a dialog is already open
@@ -3388,6 +4195,111 @@ mod win {
                 348,
                 30,
                 ID_IV_LAUNCH,
+            );
+            let sk_cap = stopkey_caption();
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &sk_cap,
+                btn_style,
+                16,
+                328,
+                176,
+                30,
+                ID_IV_STOPKEY,
+            );
+            let hk_cap = hotkey_caption();
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &hk_cap,
+                btn_style,
+                196,
+                328,
+                168,
+                30,
+                ID_IV_HOTKEY,
+            );
+            let _ = child_p(
+                0,
+                w!("STATIC"),
+                "Start in (min):",
+                label_style,
+                16,
+                372,
+                110,
+                20,
+                0,
+            );
+            let _ = child_p(
+                0,
+                w!("EDIT"),
+                "10",
+                edit_signed_style,
+                130,
+                366,
+                52,
+                30,
+                ID_IV_DELAY_EDIT,
+            );
+            let dl_cap = delay_caption();
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &dl_cap,
+                btn_style,
+                190,
+                366,
+                174,
+                30,
+                ID_IV_DELAY,
+            );
+            let fs_cap = fs_caption();
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &fs_cap,
+                btn_style,
+                16,
+                404,
+                176,
+                30,
+                ID_IV_FS,
+            );
+            let fg_cap = fg_caption();
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &fg_cap,
+                btn_style,
+                196,
+                404,
+                168,
+                30,
+                ID_IV_FG,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "Pick app...",
+                btn_style,
+                16,
+                442,
+                140,
+                30,
+                ID_IV_FG_PICK,
+            );
+            let fgl_cap = fg_label_caption();
+            let _ = child_p(
+                0,
+                w!("STATIC"),
+                &fgl_cap,
+                label_style,
+                168,
+                448,
+                196,
+                20,
+                ID_IV_FG_LABEL,
             );
 
             // ----- Page 1: Action -----
@@ -3960,23 +4872,65 @@ mod win {
                 LRESULT(0)
             }
             m if m == WM_APP_TOGGLE => {
-                lock_engine().press_keybind();
-                if lock_engine().is_clicking_now() {
-                    RUN_COUNT.store(0, Ordering::Relaxed);
-                    SEQ_IDX.store(0, Ordering::SeqCst);
-                    RUN_SET.store(false, Ordering::SeqCst);
-                    // A Locked run with no persistent point falls
-                    // back to the position where it was started.
-                    if current_mode() == ClickMode::Click
-                        && target_mode() == TargetMode::Locked
-                        && !LOCK_SET.load(Ordering::SeqCst)
-                    {
-                        capture_lock_point();
-                    }
-                } else {
-                    RUN_SET.store(false, Ordering::SeqCst);
+                handle_keybind_press(hwnd);
+                LRESULT(0)
+            }
+            m if m == WM_APP_STOP => {
+                engine_stop(hwnd);
+                LRESULT(0)
+            }
+            m if m == WM_APP_COMMAND => {
+                // A forwarded CLI command: 1 = start, 2 = stop, 3 = toggle.
+                match wparam.0 {
+                    1 => engine_start(hwnd),
+                    2 => engine_stop(hwnd),
+                    3 => handle_keybind_press(hwnd),
+                    _ => {}
                 }
+                LRESULT(0)
+            }
+            m if m == WM_APP_GATE => {
+                // The run gate flipped; settle the held button + icon.
                 refresh_indicator(hwnd);
+                LRESULT(0)
+            }
+            m if m == WM_APP_REHOTKEY => {
+                register_hotkeys(hwnd);
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                if wparam.0 as i32 == ID_HOTKEY_KEYBIND {
+                    handle_keybind_press(hwnd);
+                } else if wparam.0 as i32 == ID_HOTKEY_STOP {
+                    engine_stop(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_COPYDATA => {
+                // A forwarded CLI --profile: remember the name.
+                // (Profiles themselves arrive in v1.0.0.)
+                let cds = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
+                if cds.dwData == 1 && cds.cbData > 0 && !cds.lpData.is_null() {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize)
+                    };
+                    let name = String::from_utf8_lossy(bytes).into_owned();
+                    *pending_profile()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = name;
+                }
+                LRESULT(1)
+            }
+            WM_TIMER if wparam.0 == ID_DELAY_TIMER => {
+                // The delayed start fires: kill the one-shot timer
+                // and start clicking.
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), ID_DELAY_TIMER);
+                }
+                *delay_end()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                engine_start(hwnd);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == ID_BLINK_TIMER => {
@@ -4025,6 +4979,47 @@ mod win {
         }
     }
 
+    /// Forward a CLI command to the already-running instance, if
+    /// there is one: start/stop/toggle travel as window messages,
+    /// the profile name as WM_COPYDATA (UTF-8). Returns true when a
+    /// running window took the command (this launch should exit).
+    fn forward_cli(cmd: &CliCommand) -> bool {
+        unsafe {
+            let hwnd = match FindWindowW(w!("TrayClickMain"), PCWSTR::null()) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => return false,
+            };
+            match cmd {
+                CliCommand::Start => {
+                    let _ = PostMessageW(Some(hwnd), WM_APP_COMMAND, WPARAM(1), LPARAM(0));
+                }
+                CliCommand::Stop => {
+                    let _ = PostMessageW(Some(hwnd), WM_APP_COMMAND, WPARAM(2), LPARAM(0));
+                }
+                CliCommand::Toggle => {
+                    let _ = PostMessageW(Some(hwnd), WM_APP_COMMAND, WPARAM(3), LPARAM(0));
+                }
+                CliCommand::Profile(name) => {
+                    let bytes = name.as_bytes();
+                    let cds = COPYDATASTRUCT {
+                        dwData: 1,
+                        cbData: bytes.len() as u32,
+                        lpData: bytes.as_ptr() as *mut c_void,
+                    };
+                    // SendMessage (not Post): the data buffer must
+                    // stay valid until the receiver has copied it.
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_COPYDATA,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(&cds as *const COPYDATASTRUCT as isize)),
+                    );
+                }
+            }
+            true
+        }
+    }
+
     pub fn run() {
         // Per-monitor DPI awareness (v2), set before any window exists:
         // without it Windows virtualizes coordinates on scaled displays,
@@ -4032,6 +5027,28 @@ mod win {
         // Windows) is non-fatal — the default awareness simply stays.
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+
+        // Command-line control (item 25): a launch carrying a command
+        // forwards it to the running instance and exits. With no
+        // instance running, --start/--toggle/--profile launch the app
+        // (starting clicking for start/toggle); --stop does nothing.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let cli = parse_cli(&args);
+        let mut cli_start = false;
+        if let Some(cmd) = &cli {
+            if forward_cli(cmd) {
+                return;
+            }
+            match cmd {
+                CliCommand::Stop => return,
+                CliCommand::Start | CliCommand::Toggle => cli_start = true,
+                CliCommand::Profile(name) => {
+                    *pending_profile()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = name.clone();
+                }
+            }
         }
 
         // Single instance: a second copy would fight over the keybind.
@@ -4092,6 +5109,13 @@ mod win {
         PIXEL_RGB.store(cfg.pixel_rgb, Ordering::SeqCst);
         PIXEL_TOL.store(cfg.pixel_tol, Ordering::SeqCst);
         REGION_GUARD.store(cfg.region_guard, Ordering::SeqCst);
+        STOP_VK.store(cfg.stop_vk, Ordering::SeqCst);
+        HOTKEY_MODE.store(cfg.hotkey_mode, Ordering::SeqCst);
+        FG_RULE.store(cfg.fg_rule, Ordering::SeqCst);
+        *fg_exe()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = cfg.fg_exe.clone();
+        FS_PAUSE.store(cfg.fs_pause, Ordering::SeqCst);
         LIMIT_CLICKS.store(cfg.limit_clicks, Ordering::SeqCst);
         START_ON_LAUNCH.store(cfg.start_on_launch, Ordering::SeqCst);
         ACTION.store(action_u32(cfg.action), Ordering::SeqCst);
@@ -4154,6 +5178,10 @@ mod win {
             }
             tray_add(hwnd);
             refresh_indicator(hwnd);
+            register_hotkeys(hwnd);
+            if cli_start {
+                engine_start(hwnd);
+            }
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {

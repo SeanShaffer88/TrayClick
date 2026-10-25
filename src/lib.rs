@@ -66,6 +66,8 @@ pub enum ClickMode {
     #[default]
     Click,
     Hold,
+    /// Click only while the keybind is physically held (0.9.0).
+    Momentary,
 }
 
 impl ClickMode {
@@ -74,6 +76,7 @@ impl ClickMode {
         match self {
             ClickMode::Click => "click",
             ClickMode::Hold => "hold",
+            ClickMode::Momentary => "momentary",
         }
     }
 
@@ -82,6 +85,7 @@ impl ClickMode {
         match name {
             "click" => Some(ClickMode::Click),
             "hold" => Some(ClickMode::Hold),
+            "momentary" => Some(ClickMode::Momentary),
             _ => None,
         }
     }
@@ -91,6 +95,7 @@ impl ClickMode {
         match self {
             ClickMode::Click => "Click",
             ClickMode::Hold => "Hold",
+            ClickMode::Momentary => "Momentary",
         }
     }
 }
@@ -544,6 +549,114 @@ impl KeyPressDetector {
     }
 }
 
+/// Turns a polled key state into release events (down → up edges) —
+/// the mirror of [`KeyPressDetector`], for momentary mode, which
+/// stops when the keybind is let go. Same resync contract: after a
+/// resync the next sample only sets the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyReleaseDetector {
+    was_down: bool,
+    resync_pending: bool,
+}
+
+impl Default for KeyReleaseDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyReleaseDetector {
+    pub fn new() -> Self {
+        Self {
+            was_down: false,
+            resync_pending: true,
+        }
+    }
+
+    /// The next [`KeyReleaseDetector::sample`] sets the baseline only.
+    pub fn resync(&mut self) {
+        self.resync_pending = true;
+    }
+
+    /// Feed the key's current physical state; returns `true` exactly
+    /// once per genuine release (down → up transition outside a
+    /// resync).
+    pub fn sample(&mut self, down: bool) -> bool {
+        if self.resync_pending {
+            self.resync_pending = false;
+            self.was_down = down;
+            return false;
+        }
+        let released = !down && self.was_down;
+        self.was_down = down;
+        released
+    }
+}
+
+/// The foreground-app rule stores one process image name (e.g.
+/// `game.exe`). Valid names are short, path-free, and JSON-safe, so
+/// the hand-rolled config writer never needs escaping.
+pub fn is_valid_exe_name(name: &str) -> bool {
+    let n = name.chars().count();
+    if n == 0 || n > 64 {
+        return false;
+    }
+    if !name.to_ascii_lowercase().ends_with(".exe") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._- ".contains(c))
+}
+
+/// Delayed start accepts 1 minute to a full day.
+pub fn is_valid_delay_minutes(n: u32) -> bool {
+    (1..=1440).contains(&n)
+}
+
+/// True when a window rect covers its whole monitor rect — the
+/// fullscreen test for the auto-pause rule. Rects are
+/// `(left, top, right, bottom)`.
+pub fn rect_is_fullscreen(win: (i32, i32, i32, i32), mon: (i32, i32, i32, i32)) -> bool {
+    win.0 <= mon.0 && win.1 <= mon.1 && win.2 >= mon.2 && win.3 >= mon.3
+}
+
+/// A command-line instruction for the running instance (item 25).
+/// A second launch parses its arguments into one of these and
+/// forwards it instead of starting a second copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliCommand {
+    Start,
+    Stop,
+    Toggle,
+    Profile(String),
+}
+
+/// Parse command-line arguments into a [`CliCommand`]. The first
+/// recognised flag wins; `--profile` takes the following argument
+/// as the profile name (validated with the slot-name charset —
+/// profile names follow the same rules). Unrecognised arguments
+/// are ignored, and plain launches return `None`.
+pub fn parse_cli(args: &[String]) -> Option<CliCommand> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--start" => return Some(CliCommand::Start),
+            "--stop" => return Some(CliCommand::Stop),
+            "--toggle" => return Some(CliCommand::Toggle),
+            "--profile" => {
+                let name = args.get(i + 1)?;
+                if is_valid_slot_name(name) && !name.trim().is_empty() {
+                    return Some(CliCommand::Profile(name.clone()));
+                }
+                return None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Pick the image bytes of the best-matching entry in an `.ico` file.
 ///
 /// `desired` is the wanted icon width in pixels (e.g. the system's
@@ -588,24 +701,39 @@ pub fn ico_image_for_size(data: &[u8], desired: u32) -> Option<&[u8]> {
     best_fit.or(largest).map(|(_, image)| image)
 }
 
-/// True if `vk` may be assigned as the keybind.
+/// True if `vk` may be assigned as the keybind (or the stop key).
 ///
-/// Rejects mouse buttons (the clicker itself would retrigger them),
-/// `Esc` (it cancels the capture window), and out-of-range codes.
+/// Rejects the primary mouse buttons (the clicker itself, and the
+/// tray menu, would fight over them), `Esc` (it cancels the capture
+/// window), and out-of-range codes. The mouse side buttons X1/X2
+/// are allowed — `GetAsyncKeyState` polls them like keys.
 pub fn is_valid_keybind(vk: u32) -> bool {
     if vk == VK_ESCAPE_CODE {
         return false;
     }
-    // 0x01..=0x06 are the mouse buttons and the reserved "unassigned" code.
+    // Codes below 0x08 are the mouse buttons and the reserved
+    // "unassigned" code. The two side buttons (X1 = 0x05, X2 = 0x06)
+    // are legitimate keybinds since 0.9.0 — they cannot conflict
+    // with clicking or the tray menu — but Left/Right/Middle stay
+    // unassignable.
     if vk < 0x08 {
-        return false;
+        return vk == 0x05 || vk == 0x06;
     }
     vk <= 0xFE
+}
+
+/// True if `vk` may be assigned as the Key action's repeat key.
+/// Stricter than the keybind rule: the repeat key is synthesized as
+/// a *keyboard* event, so mouse buttons (including X1/X2) are out.
+pub fn is_valid_repeat_key(vk: u32) -> bool {
+    vk != VK_ESCAPE_CODE && (0x08..=0xFE).contains(&vk)
 }
 
 /// A human-readable name for a virtual-key code, e.g. `F6`, `A`, `Space`.
 pub fn key_name(vk: u32) -> String {
     match vk {
+        0x05 => "Mouse X1".to_string(),
+        0x06 => "Mouse X2".to_string(),
         0x08 => "Backspace".to_string(),
         0x09 => "Tab".to_string(),
         0x0D => "Enter".to_string(),
@@ -715,6 +843,23 @@ pub struct Config {
     pub pixel_tol: u32,
     /// Stop the run when the region around the click point changes.
     pub region_guard: bool,
+    // Fields added in 0.9.0 (50-enhancement program, slice 4 —
+    // triggers & automation).
+    /// A separate stop-only key (a virtual-key code; 0 = unset).
+    /// May be a mouse side button, like the keybind.
+    pub stop_vk: u32,
+    /// Use RegisterHotKey instead of polling for the keybind and
+    /// stop key (near-zero idle CPU). Polling stays the default and
+    /// the fallback whenever a hotkey cannot be registered (and for
+    /// mouse-button bindings and momentary mode, which need release
+    /// events hotkeys cannot deliver).
+    pub hotkey_mode: bool,
+    /// The foreground-app rule: cycles run only while `fg_exe` is
+    /// the foreground process (empty = no app picked yet).
+    pub fg_rule: bool,
+    pub fg_exe: String,
+    /// Pause cycles while a fullscreen window is in the foreground.
+    pub fs_pause: bool,
 }
 
 impl Default for Config {
@@ -766,6 +911,11 @@ impl Default for Config {
             pixel_rgb: 0,
             pixel_tol: DEFAULT_PIXEL_TOL,
             region_guard: false,
+            stop_vk: 0,
+            hotkey_mode: false,
+            fg_rule: false,
+            fg_exe: String::new(),
+            fs_pause: false,
         }
     }
 }
@@ -827,7 +977,7 @@ impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {},\n  \"target\": \"{}\",\n  \"lock_x\": {},\n  \"lock_y\": {},\n  \"lock_set\": {},\n  \"lock_rel\": {},\n  \"lock_rx\": {},\n  \"lock_ry\": {},\n  \"seq_count\": {},\n  \"seq_x1\": {},\n  \"seq_y1\": {},\n  \"seq_x2\": {},\n  \"seq_y2\": {},\n  \"seq_x3\": {},\n  \"seq_y3\": {},\n  \"seq_x4\": {},\n  \"seq_y4\": {},\n  \"slot1_x\": {},\n  \"slot1_y\": {},\n  \"slot1_set\": {},\n  \"slot1_name\": \"{}\",\n  \"slot2_x\": {},\n  \"slot2_y\": {},\n  \"slot2_set\": {},\n  \"slot2_name\": \"{}\",\n  \"slot3_x\": {},\n  \"slot3_y\": {},\n  \"slot3_set\": {},\n  \"slot3_name\": \"{}\",\n  \"offset_x\": {},\n  \"offset_y\": {},\n  \"pixel_check\": {},\n  \"pixel_set\": {},\n  \"pixel_rgb\": {},\n  \"pixel_tol\": {},\n  \"region_guard\": {}\n}}\n",
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {},\n  \"target\": \"{}\",\n  \"lock_x\": {},\n  \"lock_y\": {},\n  \"lock_set\": {},\n  \"lock_rel\": {},\n  \"lock_rx\": {},\n  \"lock_ry\": {},\n  \"seq_count\": {},\n  \"seq_x1\": {},\n  \"seq_y1\": {},\n  \"seq_x2\": {},\n  \"seq_y2\": {},\n  \"seq_x3\": {},\n  \"seq_y3\": {},\n  \"seq_x4\": {},\n  \"seq_y4\": {},\n  \"slot1_x\": {},\n  \"slot1_y\": {},\n  \"slot1_set\": {},\n  \"slot1_name\": \"{}\",\n  \"slot2_x\": {},\n  \"slot2_y\": {},\n  \"slot2_set\": {},\n  \"slot2_name\": \"{}\",\n  \"slot3_x\": {},\n  \"slot3_y\": {},\n  \"slot3_set\": {},\n  \"slot3_name\": \"{}\",\n  \"offset_x\": {},\n  \"offset_y\": {},\n  \"pixel_check\": {},\n  \"pixel_set\": {},\n  \"pixel_rgb\": {},\n  \"pixel_tol\": {},\n  \"region_guard\": {},\n  \"stop_vk\": {},\n  \"hotkey_mode\": {},\n  \"fg_rule\": {},\n  \"fg_exe\": \"{}\",\n  \"fs_pause\": {}\n}}\n",
             self.keybind_vk,
             self.interval_ms,
             self.button.as_str(),
@@ -887,7 +1037,12 @@ impl Config {
             self.pixel_set,
             self.pixel_rgb,
             self.pixel_tol,
-            self.region_guard
+            self.region_guard,
+            self.stop_vk,
+            self.hotkey_mode,
+            self.fg_rule,
+            self.fg_exe,
+            self.fs_pause
         )
     }
 
@@ -979,7 +1134,7 @@ impl Config {
         };
         let repeat_vk = match json_u32(text, "\"repeat_vk\"") {
             Some(v) => {
-                if !is_valid_keybind(v) {
+                if !is_valid_repeat_key(v) {
                     return None;
                 }
                 v
@@ -1099,6 +1254,29 @@ impl Config {
             None => DEFAULT_PIXEL_TOL,
         };
         let region_guard = opt_bool(text, "\"region_guard\"")?;
+        // Fields added in 0.9.0 (slice 4 — triggers & automation);
+        // absent in older files, defaults apply.
+        let stop_vk = match json_u32(text, "\"stop_vk\"") {
+            Some(n) => {
+                if n != 0 && !is_valid_keybind(n) {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let hotkey_mode = opt_bool(text, "\"hotkey_mode\"")?;
+        let fg_rule = opt_bool(text, "\"fg_rule\"")?;
+        let fg_exe = match json_str(text, "\"fg_exe\"") {
+            Some(name) => {
+                if !name.is_empty() && !is_valid_exe_name(&name) {
+                    return None;
+                }
+                name
+            }
+            None => String::new(),
+        };
+        let fs_pause = opt_bool(text, "\"fs_pause\"")?;
         Some(Self {
             keybind_vk: vk,
             interval_ms,
@@ -1146,6 +1324,11 @@ impl Config {
             pixel_rgb,
             pixel_tol,
             region_guard,
+            stop_vk,
+            hotkey_mode,
+            fg_rule,
+            fg_exe,
+            fs_pause,
         })
     }
 }
@@ -1311,6 +1494,11 @@ mod tests {
             pixel_rgb: 0x00FF_8040,
             pixel_tol: 24,
             region_guard: true,
+            stop_vk: 0x77, // F8
+            hotkey_mode: true,
+            fg_rule: true,
+            fg_exe: "game.exe".to_string(),
+            fs_pause: true,
         };
         let json = cfg.to_json();
         assert_eq!(Config::from_json(&json), Some(cfg));
@@ -1405,6 +1593,102 @@ mod tests {
         // A monitor left of the primary (negative coordinates).
         let neg = [(-1920, 0, 0, 1080), (0, 0, 1920, 1080)];
         assert_eq!(other_monitor_centre(&neg, (100, 100)), Some((-960, 540)));
+    }
+
+    #[test]
+    fn config_from_080_gets_slice4_defaults() {
+        let cfg = Config::from_json("{\"keybind_vk\": 117, \"mode\": \"momentary\"}").unwrap();
+        assert_eq!(cfg.mode, ClickMode::Momentary);
+        assert_eq!(cfg.stop_vk, 0);
+        assert!(!cfg.hotkey_mode);
+        assert!(!cfg.fg_rule);
+        assert_eq!(cfg.fg_exe, "");
+        assert!(!cfg.fs_pause);
+    }
+
+    #[test]
+    fn config_rejects_bad_slice4_fields() {
+        for bad in [
+            "{\"keybind_vk\": 117, \"stop_vk\": 1}",  // left mouse button
+            "{\"keybind_vk\": 117, \"stop_vk\": 27}", // Esc
+            "{\"keybind_vk\": 117, \"fg_exe\": \"notanexe.txt\"}",
+            "{\"keybind_vk\": 117, \"fg_exe\": \"dir/game.exe\"}",
+            "{\"keybind_vk\": 117, \"repeat_vk\": 5}", // X1 is no repeat key
+        ] {
+            assert_eq!(Config::from_json(bad), None, "{bad}");
+        }
+        // An X-button stop key and a spaced exe name are legitimate.
+        assert!(Config::from_json(
+            "{\"keybind_vk\": 5, \"stop_vk\": 6, \"fg_exe\": \"My Game.exe\"}"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn keybind_validity_includes_side_buttons() {
+        assert!(is_valid_keybind(0x05)); // X1
+        assert!(is_valid_keybind(0x06)); // X2
+        assert!(!is_valid_keybind(0x01)); // Left
+        assert!(!is_valid_keybind(0x02)); // Right
+        assert!(!is_valid_keybind(0x04)); // Middle
+        assert!(!is_valid_repeat_key(0x05));
+        assert!(is_valid_repeat_key(0x20));
+        assert_eq!(key_name(0x05), "Mouse X1");
+        assert_eq!(key_name(0x06), "Mouse X2");
+        assert_eq!(
+            ClickMode::from_name("momentary"),
+            Some(ClickMode::Momentary)
+        );
+    }
+
+    #[test]
+    fn release_detector_edges() {
+        let mut d = KeyReleaseDetector::new();
+        assert!(!d.sample(true)); // resync baseline: held
+        assert!(!d.sample(true)); // still held: no release
+        assert!(d.sample(false)); // released: one edge
+        assert!(!d.sample(false)); // still up: no repeat
+        assert!(!d.sample(true)); // pressed again: not a release
+        assert!(d.sample(false)); // released again
+        d.resync();
+        assert!(!d.sample(false)); // resync swallows state
+    }
+
+    #[test]
+    fn trigger_helpers() {
+        assert!(is_valid_exe_name("game.exe"));
+        assert!(is_valid_exe_name("My Game.EXE"));
+        assert!(!is_valid_exe_name(""));
+        assert!(!is_valid_exe_name("game"));
+        assert!(!is_valid_exe_name("a/b.exe"));
+        assert!(is_valid_delay_minutes(1));
+        assert!(is_valid_delay_minutes(1440));
+        assert!(!is_valid_delay_minutes(0));
+        assert!(!is_valid_delay_minutes(1441));
+        let mon = (0, 0, 1920, 1080);
+        assert!(rect_is_fullscreen((0, 0, 1920, 1080), mon));
+        assert!(rect_is_fullscreen((-8, -8, 1928, 1088), mon));
+        assert!(!rect_is_fullscreen((0, 0, 1919, 1080), mon));
+        assert!(!rect_is_fullscreen((100, 100, 800, 600), mon));
+    }
+
+    #[test]
+    fn cli_parsing() {
+        let a = |s: &[&str]| -> Vec<String> { s.iter().map(|x| x.to_string()).collect() };
+        assert_eq!(parse_cli(&a(&[])), None);
+        assert_eq!(parse_cli(&a(&["--start"])), Some(CliCommand::Start));
+        assert_eq!(parse_cli(&a(&["--stop"])), Some(CliCommand::Stop));
+        assert_eq!(parse_cli(&a(&["--toggle"])), Some(CliCommand::Toggle));
+        assert_eq!(
+            parse_cli(&a(&["--profile", "Gaming"])),
+            Some(CliCommand::Profile("Gaming".to_string()))
+        );
+        assert_eq!(parse_cli(&a(&["--profile"])), None);
+        assert_eq!(parse_cli(&a(&["--profile", "bad\"name"])), None);
+        assert_eq!(
+            parse_cli(&a(&["--bogus", "--start"])),
+            Some(CliCommand::Start)
+        );
     }
 
     #[test]
