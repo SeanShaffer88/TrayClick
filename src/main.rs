@@ -27,7 +27,11 @@
 //! or lock to the position where clicking started — each click moves
 //! to the locked point, clicks, and puts the cursor back), an
 //! auto-stop limit in clicks per run (0 = none), and start-on-launch
-//! (click mode only).
+//! (click mode only). The 0.6.0 slice (50-enhancement program) added
+//! the click action — single, double, or a burst of clicks — plus a
+//! per-click button-down duration and alternating buttons, and made
+//! the process per-monitor DPI aware so locked clicks land exactly
+//! on scaled displays.
 //!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
@@ -58,10 +62,11 @@ mod win {
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        absolute_coord, format_count, ico_image_for_size, in_failsafe_corner, is_valid_interval,
-        is_valid_keybind, is_valid_limit, jittered_interval_ms, key_name, next_click_deadline,
-        ClickButton, ClickMode, Config, Engine, KeyPressDetector, MAX_INTERVAL_MS, MIN_INTERVAL_MS,
-        VK_ESCAPE_CODE,
+        absolute_coord, effective_button, format_count, ico_image_for_size, in_failsafe_corner,
+        is_valid_burst_clicks, is_valid_burst_gap, is_valid_interval, is_valid_keybind,
+        is_valid_limit, is_valid_press_ms, jittered_interval_ms, key_name, next_click_deadline,
+        ClickAction, ClickButton, ClickMode, Config, Engine, KeyPressDetector, MAX_INTERVAL_MS,
+        MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
@@ -78,6 +83,9 @@ mod win {
         HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE,
     };
     use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
         MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
@@ -127,6 +135,12 @@ mod win {
     const ID_IV_LIMIT_EDIT: usize = 2011;
     const ID_IV_LIMIT_SET: usize = 2012;
     const ID_IV_LAUNCH: usize = 2013;
+    const ID_IV_ACTION: usize = 2014;
+    const ID_IV_ALT: usize = 2015;
+    const ID_IV_BURST_EDIT: usize = 2016;
+    const ID_IV_GAP_EDIT: usize = 2017;
+    const ID_IV_PRESS_EDIT: usize = 2018;
+    const ID_IV_NUM_SET: usize = 2019;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
@@ -153,6 +167,15 @@ mod win {
     static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
     /// Whether clicking starts when TrayClick launches (click mode).
     static START_ON_LAUNCH: AtomicBool = AtomicBool::new(false);
+    /// The click action: 0 = Single, 1 = Double, 2 = Burst.
+    static ACTION: AtomicU32 = AtomicU32::new(0);
+    /// Clicks per burst (burst action) and the gap between them.
+    static BURST_CLICKS: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_BURST_CLICKS);
+    static BURST_GAP_MS: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_BURST_GAP_MS);
+    /// How long each click holds its button down (0 = instant).
+    static PRESS_MS: AtomicU32 = AtomicU32::new(0);
+    /// Whether consecutive clicks alternate between button partners.
+    static ALTERNATE: AtomicBool = AtomicBool::new(false);
     /// Whether the mouse button is currently held down (hold mode).
     /// Every stop path funnels through `refresh_indicator`, which calls
     /// `sync_hold_state` — so every stop path releases the button.
@@ -258,6 +281,22 @@ mod win {
         }
     }
 
+    fn action_u32(a: ClickAction) -> u32 {
+        match a {
+            ClickAction::Single => 0,
+            ClickAction::Double => 1,
+            ClickAction::Burst => 2,
+        }
+    }
+
+    fn current_action() -> ClickAction {
+        match ACTION.load(Ordering::SeqCst) {
+            1 => ClickAction::Double,
+            2 => ClickAction::Burst,
+            _ => ClickAction::Single,
+        }
+    }
+
     /// The live settings as a `Config`, for persisting after a change.
     fn current_config() -> Config {
         Config {
@@ -269,6 +308,11 @@ mod win {
             lock_position: LOCK_POS.load(Ordering::SeqCst),
             limit_clicks: LIMIT_CLICKS.load(Ordering::SeqCst),
             start_on_launch: START_ON_LAUNCH.load(Ordering::SeqCst),
+            action: current_action(),
+            burst_clicks: BURST_CLICKS.load(Ordering::SeqCst),
+            burst_gap_ms: BURST_GAP_MS.load(Ordering::SeqCst),
+            press_ms: PRESS_MS.load(Ordering::SeqCst),
+            alternate: ALTERNATE.load(Ordering::SeqCst),
         }
     }
 
@@ -314,14 +358,32 @@ mod win {
         }
     }
 
-    fn send_click() {
-        let (down, up) = button_flags(current_button());
+    /// Send one physical click of `btn`, honouring the locked target
+    /// and the configured button-down duration (`press_ms`; 0 sends
+    /// down+up as one batch, as always).
+    fn click_once(btn: ClickButton) {
+        let (down, up) = button_flags(btn);
+        let press = PRESS_MS.load(Ordering::SeqCst);
         if LOCK_POS.load(Ordering::SeqCst) && LOCK_SET.load(Ordering::SeqCst) {
-            send_click_locked(down, up);
-        } else {
+            click_once_locked(down, up, press);
+        } else if press == 0 {
             let inputs = [mouse_input(0, 0, down), mouse_input(0, 0, up)];
             unsafe {
                 SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            }
+        } else {
+            unsafe {
+                SendInput(
+                    &[mouse_input(0, 0, down)],
+                    std::mem::size_of::<INPUT>() as i32,
+                );
+            }
+            std::thread::sleep(Duration::from_millis(press as u64));
+            unsafe {
+                SendInput(
+                    &[mouse_input(0, 0, up)],
+                    std::mem::size_of::<INPUT>() as i32,
+                );
             }
         }
         CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -329,10 +391,11 @@ mod win {
     }
 
     /// Click at the locked point, then put the cursor back where the
-    /// user left it — all in one SendInput batch, so the pointer only
-    /// leaves for the instant of the click and the user can keep
-    /// working elsewhere.
-    fn send_click_locked(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS) {
+    /// user left it. With no press duration this is one SendInput
+    /// batch, so the pointer only leaves for the instant of the click;
+    /// with a press duration the button-down batch goes first, the
+    /// duration elapses, then the release + restore batch follows.
+    fn click_once_locked(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS, press: u32) {
         unsafe {
             let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -346,14 +409,60 @@ mod win {
                 )
             };
             let target = abs_to(LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst));
+            let size = std::mem::size_of::<INPUT>() as i32;
             let mut cur = POINT::default();
             if GetCursorPos(&mut cur).is_ok() {
                 let back = abs_to(cur.x, cur.y);
-                let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up), back];
-                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-            } else {
+                if press == 0 {
+                    let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up), back];
+                    SendInput(&inputs, size);
+                } else {
+                    SendInput(&[target, mouse_input(0, 0, down)], size);
+                    std::thread::sleep(Duration::from_millis(press as u64));
+                    SendInput(&[mouse_input(0, 0, up), back], size);
+                }
+            } else if press == 0 {
                 let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up)];
-                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+                SendInput(&inputs, size);
+            } else {
+                SendInput(&[target, mouse_input(0, 0, down)], size);
+                std::thread::sleep(Duration::from_millis(press as u64));
+                SendInput(&[mouse_input(0, 0, up)], size);
+            }
+        }
+    }
+
+    /// One activation cycle: the configured action (single, double, or
+    /// a burst of clicks spaced by the burst gap). Stops early if
+    /// clicking was switched off, the failsafe trips, or the run hits
+    /// its auto-stop limit — a long burst never outlives any of them.
+    /// The clicker's own limit check settles the stop afterwards.
+    fn perform_cycle() {
+        let n = match current_action() {
+            ClickAction::Single => 1,
+            ClickAction::Double => 2,
+            ClickAction::Burst => BURST_CLICKS.load(Ordering::SeqCst),
+        };
+        let gap = Duration::from_millis(BURST_GAP_MS.load(Ordering::SeqCst) as u64);
+        for i in 0..n {
+            if i > 0 {
+                std::thread::sleep(gap);
+                if !lock_engine().is_clicking_now() {
+                    return;
+                }
+                if cursor_in_failsafe() {
+                    trip_failsafe();
+                    return;
+                }
+            }
+            let btn = effective_button(
+                current_button(),
+                ALTERNATE.load(Ordering::SeqCst),
+                RUN_COUNT.load(Ordering::Relaxed),
+            );
+            click_once(btn);
+            if limit_reached() {
+                return;
             }
         }
     }
@@ -544,12 +653,12 @@ mod win {
             }
             match deadline {
                 None => {
-                    send_click();
+                    perform_cycle();
                     deadline = Some(Instant::now() + effective_interval(&mut rng));
                 }
                 Some(d) => {
                     if Instant::now() >= d {
-                        send_click();
+                        perform_cycle();
                         deadline = Some(next_click_deadline(
                             d,
                             effective_interval(&mut rng),
@@ -866,6 +975,10 @@ mod win {
         };
         let clicks = format_count(CLICK_COUNT.load(Ordering::Relaxed));
         let mode = current_mode().label();
+        let action = match current_action() {
+            ClickAction::Burst => format!("Burst ×{}", BURST_CLICKS.load(Ordering::SeqCst)),
+            a => a.label().to_string(),
+        };
         let target = if LOCK_POS.load(Ordering::SeqCst) {
             "Locked position"
         } else {
@@ -879,6 +992,7 @@ mod win {
              Interval: {interval} ms (set it from the tray menu).\r\n\
              Button: {button}\r\n\
              Mode: {mode}\r\n\
+             Action: {action}\r\n\
              Target: {target}\r\n\
              Jitter: {jitter}\r\n\
              Clicks this session: {clicks}\r\n\r\n\
@@ -1081,6 +1195,9 @@ mod win {
                     ID_IV_POS => apply_pos(hwnd),
                     ID_IV_LIMIT_SET => apply_limit(hwnd),
                     ID_IV_LAUNCH => apply_launch(hwnd),
+                    ID_IV_ACTION => apply_action(hwnd),
+                    ID_IV_ALT => apply_alt(hwnd),
+                    ID_IV_NUM_SET => apply_numbers(hwnd),
                     // IDCANCEL (2) arrives when Esc is pressed via the
                     // dialog message loop.
                     2 => {
@@ -1147,6 +1264,18 @@ mod win {
         }
     }
 
+    fn action_caption() -> String {
+        format!("Action: {}", current_action().label())
+    }
+
+    fn alt_caption() -> &'static str {
+        if ALTERNATE.load(Ordering::SeqCst) {
+            "Alternate buttons: On"
+        } else {
+            "Alternate buttons: Off"
+        }
+    }
+
     /// Repaint the button-row and jitter captions after a change.
     fn relabel_interval_controls(hwnd: HWND) {
         unsafe {
@@ -1175,6 +1304,14 @@ mod win {
             if let Ok(lb) = GetDlgItem(Some(hwnd), ID_IV_LAUNCH as i32) {
                 let t = wide(launch_caption());
                 let _ = SetWindowTextW(lb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(ab) = GetDlgItem(Some(hwnd), ID_IV_ACTION as i32) {
+                let t = wide(&action_caption());
+                let _ = SetWindowTextW(ab, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(tb) = GetDlgItem(Some(hwnd), ID_IV_ALT as i32) {
+                let t = wide(alt_caption());
+                let _ = SetWindowTextW(tb, PCWSTR(t.as_ptr()));
             }
         }
     }
@@ -1230,6 +1367,78 @@ mod win {
         relabel_interval_controls(hwnd);
         unsafe {
             let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_action(hwnd: HWND) {
+        let next = match current_action() {
+            ClickAction::Single => ClickAction::Double,
+            ClickAction::Double => ClickAction::Burst,
+            ClickAction::Burst => ClickAction::Single,
+        };
+        ACTION.store(action_u32(next), Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_alt(hwnd: HWND) {
+        let on = !ALTERNATE.load(Ordering::SeqCst);
+        ALTERNATE.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Read one numeric edit control in the settings window.
+    fn read_edit_u32(hwnd: HWND, id: usize) -> Option<u32> {
+        let edit = unsafe { GetDlgItem(Some(hwnd), id as i32) }.ok()?;
+        let mut buf = [0u16; 16];
+        let n = unsafe { GetWindowTextW(edit, &mut buf) };
+        if n <= 0 {
+            return None;
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+            .trim()
+            .parse::<u32>()
+            .ok()
+    }
+
+    /// Apply the three numeric action fields (burst clicks, burst gap,
+    /// button-down time) at once; all three must be valid, or nothing
+    /// changes and a warning explains the ranges.
+    fn apply_numbers(hwnd: HWND) {
+        let burst = read_edit_u32(hwnd, ID_IV_BURST_EDIT);
+        let gap = read_edit_u32(hwnd, ID_IV_GAP_EDIT);
+        let press = read_edit_u32(hwnd, ID_IV_PRESS_EDIT);
+        let valid = matches!(burst, Some(n) if is_valid_burst_clicks(n))
+            && matches!(gap, Some(n) if is_valid_burst_gap(n))
+            && matches!(press, Some(n) if is_valid_press_ms(n));
+        if valid {
+            BURST_CLICKS.store(burst.unwrap_or_default(), Ordering::SeqCst);
+            BURST_GAP_MS.store(gap.unwrap_or_default(), Ordering::SeqCst);
+            PRESS_MS.store(press.unwrap_or_default(), Ordering::SeqCst);
+            save_config(current_config());
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+        } else {
+            let text = wide(
+                "Burst: 1 to 100 clicks. Gap: 1 to 1000 ms. Down: 0 to 1000 ms (0 = instant).",
+            );
+            let title = wide("TrayClick — Set Interval");
+            unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
         }
     }
 
@@ -1293,7 +1502,7 @@ mod win {
                 RegisterClassW(&wc);
             }
             let width = 396;
-            let height = 356;
+            let height = 488;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = match CreateWindowExW(
@@ -1520,10 +1729,97 @@ mod win {
             );
             let _ = child(
                 w!("STATIC"),
-                "Presets apply at once. Custom interval: type a value and click Apply (range 1–60000). Everything else applies at once. Esc cancels.",
+                "Click action:",
                 label_style,
                 16,
-                296,
+                300,
+                360,
+                20,
+                0,
+            );
+            let act_cap = action_caption();
+            let _ = child(
+                w!("BUTTON"),
+                &act_cap,
+                btn_style,
+                16,
+                324,
+                150,
+                30,
+                ID_IV_ACTION,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                alt_caption(),
+                btn_style,
+                176,
+                324,
+                188,
+                30,
+                ID_IV_ALT,
+            );
+            let _ = child(
+                w!("STATIC"),
+                "Burst count, gap and button-down time:",
+                label_style,
+                16,
+                366,
+                360,
+                20,
+                0,
+            );
+            let _ = child(w!("STATIC"), "Burst:", label_style, 16, 396, 40, 20, 0);
+            let burst_now = BURST_CLICKS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &burst_now,
+                edit_style,
+                58,
+                390,
+                40,
+                30,
+                ID_IV_BURST_EDIT,
+            );
+            let _ = child(w!("STATIC"), "Gap:", label_style, 106, 396, 32, 20, 0);
+            let gap_now = BURST_GAP_MS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &gap_now,
+                edit_style,
+                140,
+                390,
+                48,
+                30,
+                ID_IV_GAP_EDIT,
+            );
+            let _ = child(w!("STATIC"), "Down:", label_style, 196, 396, 40, 20, 0);
+            let press_now = PRESS_MS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &press_now,
+                edit_style,
+                238,
+                390,
+                48,
+                30,
+                ID_IV_PRESS_EDIT,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                "Set",
+                btn_style,
+                294,
+                390,
+                70,
+                30,
+                ID_IV_NUM_SET,
+            );
+            let _ = child(
+                w!("STATIC"),
+                "Presets apply at once. Custom interval: type a value and click Apply (range 1–60000). Numbers apply with their Set buttons. Esc cancels.",
+                label_style,
+                16,
+                428,
                 360,
                 36,
                 0,
@@ -1626,6 +1922,14 @@ mod win {
     }
 
     pub fn run() {
+        // Per-monitor DPI awareness (v2), set before any window exists:
+        // without it Windows virtualizes coordinates on scaled displays,
+        // and locked-position clicks land off target. Failure (very old
+        // Windows) is non-fatal — the default awareness simply stays.
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+
         // Single instance: a second copy would fight over the keybind.
         // The handle is held in this binding until `run` returns at
         // process exit. (In the `windows` crate `HANDLE` is a plain
@@ -1660,6 +1964,11 @@ mod win {
         LOCK_POS.store(cfg.lock_position, Ordering::SeqCst);
         LIMIT_CLICKS.store(cfg.limit_clicks, Ordering::SeqCst);
         START_ON_LAUNCH.store(cfg.start_on_launch, Ordering::SeqCst);
+        ACTION.store(action_u32(cfg.action), Ordering::SeqCst);
+        BURST_CLICKS.store(cfg.burst_clicks, Ordering::SeqCst);
+        BURST_GAP_MS.store(cfg.burst_gap_ms, Ordering::SeqCst);
+        PRESS_MS.store(cfg.press_ms, Ordering::SeqCst);
+        ALTERNATE.store(cfg.alternate, Ordering::SeqCst);
         if cfg.start_on_launch && cfg.mode == ClickMode::Click {
             lock_engine().clicking = true;
             if cfg.lock_position {
