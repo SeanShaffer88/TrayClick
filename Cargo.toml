@@ -1,8 +1,8 @@
 [package]
 name = "trayclick"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "A tiny Windows tray auto clicker: one keybind toggles clicking — or holding — any mouse button at the cursor or a locked spot, at a set interval with optional jitter and an auto-stop limit."
+description = "A tiny Windows tray auto clicker: one keybind toggles clicking — or holding — any mouse button at the cursor, a locked spot, or a rotating sequence of points, at a set interval with optional jitter, an auto-stop limit, a pixel check, and a region guard."
 license = "MIT"
 authors = ["Sean Shaffer"]
 

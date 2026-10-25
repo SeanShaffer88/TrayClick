@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.0 — 2026-10-25
+
+Slice 3 of the 50-enhancement program (docs/PROGRAM-50.md): targeting. The settings window is now paged — **Clicking**, **Action**, and **Targeting** tabs (it remembers which tab you left it on) — and the Target control cycles three ways: Follow, Locked, Sequence.
+
+- **Crosshair picker (item 17).** "Pick lock point" (Targeting tab) closes the settings window and covers the screen: one click sets a **persistent** lock point that survives restarts. The old behaviour — a Locked run with no picked point locks to wherever clicking started — remains as the fallback.
+- **Multi-point sequence (item 10).** With the Sequence target, clicks (and scrolls) rotate through up to 4 points, one per cycle. "Set sequence points" uses the same crosshair overlay: click each point, right-click to finish early, Esc cancels.
+- **Named target slots (item 11).** Three slots on the Targeting tab: type a name, **Save** stores the lock point (or, if none is set, the cursor), **Use** makes that point the lock point and switches the target to Locked.
+- **Click offset (item 12).** Shift every click by X/Y pixels (−200 to 200 per axis) from the cursor or the lock point, for targets whose real hot spot sits off the pointer.
+- **Pixel check (item 13).** Sample a colour (read at the lock point, or the cursor), set a tolerance (0–64 per channel), and turn the check on: cycles then act only while the pixel at the click point still matches. Blocked cycles are skipped silently and do not count.
+- **Region-change stop (item 14).** The region guard samples an 8×8 patch of pixels around the click point when a run starts and stops the run when that patch visibly changes — a "stop when the screen changes" failsafe next to the corner one. In Follow mode the patch anchors where the cursor was when the run started.
+- **Window-relative lock (item 15).** With this on, picking a lock point also remembers the window under it; the point then follows that window when it moves (same offset from its top-left corner). If the window closes, the absolute point is used. The window itself is matched live and never saved.
+- **Other-monitor preset (item 16).** "Other monitor centre" sets the lock point to the centre of your other monitor and switches the target to Locked. (With one monitor it just says so.)
+
+Two quieter notes: the pixel check and region guard apply to the click and scroll actions (Key and Drag cycles have no target pixel to watch), and the scroll-amount box now accepts typing a minus sign (it previously used a digits-only style).
+
+Config files from every earlier version load unchanged — the target defaults to Follow (or Locked when the old lock flag was set), and everything new starts unset/off.
+
 ## 0.7.0 — 2026-10-25
 
 Slice 2 of the 50-enhancement program (docs/PROGRAM-50.md): three more actions, plus interval shaping.

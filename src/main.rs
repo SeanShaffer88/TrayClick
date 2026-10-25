@@ -37,6 +37,18 @@
 //! a per-run speed ramp. Hold mode applies to the mouse-click
 //! actions only; Scroll/Key/Drag repeat on the interval either way.
 //!
+//! The 0.8.0 slice is all about targeting. The target is now three-way
+//! (follow the cursor, one locked point, or a rotating sequence of up
+//! to four points); the lock point is persistent and can be picked
+//! with a crosshair overlay, saved into three named slots, jumped to
+//! the other monitor's centre, and followed window-relatively (it
+//! tracks the window it was picked on). Clicks can be offset by a few
+//! pixels, gated by a pixel check (click only while a watched pixel
+//! keeps its colour), and guarded by a region check (the run stops
+//! when the patch of screen around the point changes). The Set
+//! Interval window is paged (Clicking / Action / Targeting tabs) and
+//! remembers its page.
+//!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
 //! indefinitely, until the keybind is pressed again. While clicking is
@@ -66,21 +78,23 @@ mod win {
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        absolute_coord, effective_button, format_count, ico_image_for_size, in_failsafe_corner,
-        is_extended_key, is_valid_burst_clicks, is_valid_burst_gap, is_valid_interval,
-        is_valid_keybind, is_valid_limit, is_valid_press_ms, is_valid_ramp_seconds,
-        is_valid_scroll_amount, jittered_interval_ms, key_name, next_click_deadline,
-        ramped_interval_ms, ClickAction, ClickButton, ClickMode, Config, Engine, KeyPressDetector,
-        MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        absolute_coord, colour_matches, effective_button, format_count, ico_image_for_size,
+        in_failsafe_corner, is_extended_key, is_valid_burst_clicks, is_valid_burst_gap,
+        is_valid_interval, is_valid_keybind, is_valid_limit, is_valid_offset, is_valid_pixel_tol,
+        is_valid_press_ms, is_valid_ramp_seconds, is_valid_scroll_amount, jittered_interval_ms,
+        key_name, next_click_deadline, other_monitor_centre, ramped_interval_ms, region_changed,
+        sanitize_slot_name, ClickAction, ClickButton, ClickMode, Config, Engine, KeyPressDetector,
+        TargetMode, DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{
         GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT,
-        WPARAM,
+        RECT, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
-        CreateSolidBrush, SetBkMode, SetTextColor, HBRUSH, TRANSPARENT,
+        CreateSolidBrush, EnumDisplayMonitors, GetDC, GetPixel, ReleaseDC, SetBkMode, SetTextColor,
+        HBRUSH, HDC, HMONITOR, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Registry::{
@@ -113,6 +127,8 @@ mod win {
     const WM_APP_FAILSAFE: u32 = WM_APP + 2;
     /// Posted by the click thread when the auto-stop limit is reached.
     const WM_APP_LIMIT: u32 = WM_APP + 3;
+    /// Posted by the click thread when the region guard stops a run.
+    const WM_APP_REGION: u32 = WM_APP + 4;
 
     const TRAY_ID: u32 = 1;
 
@@ -156,6 +172,37 @@ mod win {
     const ID_IV_RAMP_TO_EDIT: usize = 2026;
     const ID_IV_RAMP_SECS_EDIT: usize = 2027;
     const ID_IV_TIMING_SET: usize = 2028;
+    // Settings-window page buttons (0.8.0 — the window is paged).
+    const ID_IV_PAGE_CLICK: usize = 2101;
+    const ID_IV_PAGE_ACTION: usize = 2102;
+    const ID_IV_PAGE_TARGET: usize = 2103;
+    // Targeting page controls (0.8.0).
+    const ID_IV_PICK_LOCK: usize = 2104;
+    const ID_IV_OTHER_MON: usize = 2105;
+    const ID_IV_WINREL: usize = 2106;
+    const ID_IV_REGION: usize = 2107;
+    const ID_IV_SEQ_SET: usize = 2108;
+    const ID_IV_SEQ_CLEAR: usize = 2109;
+    const ID_IV_SLOT1_NAME: usize = 2110;
+    const ID_IV_SLOT1_SAVE: usize = 2111;
+    const ID_IV_SLOT1_USE: usize = 2112;
+    const ID_IV_SLOT1_COORDS: usize = 2113;
+    const ID_IV_SLOT2_NAME: usize = 2114;
+    const ID_IV_SLOT2_SAVE: usize = 2115;
+    const ID_IV_SLOT2_USE: usize = 2116;
+    const ID_IV_SLOT2_COORDS: usize = 2117;
+    const ID_IV_SLOT3_NAME: usize = 2118;
+    const ID_IV_SLOT3_SAVE: usize = 2119;
+    const ID_IV_SLOT3_USE: usize = 2120;
+    const ID_IV_SLOT3_COORDS: usize = 2121;
+    const ID_IV_OFF_X_EDIT: usize = 2122;
+    const ID_IV_OFF_Y_EDIT: usize = 2123;
+    const ID_IV_OFF_SET: usize = 2124;
+    const ID_IV_PIXEL: usize = 2125;
+    const ID_IV_PIXEL_SAMPLE: usize = 2126;
+    const ID_IV_TOL_EDIT: usize = 2127;
+    const ID_IV_TOL_SET: usize = 2128;
+    const ID_IV_FOOTER: usize = 2129;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
@@ -169,13 +216,76 @@ mod win {
     static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
     /// The mode: 0 = Click, 1 = Hold.
     static MODE: AtomicU32 = AtomicU32::new(0);
-    /// Whether clicks lock to the position captured when clicking
-    /// started instead of following the cursor.
-    static LOCK_POS: AtomicBool = AtomicBool::new(false);
-    /// The captured lock point and whether one is set for this run.
+    /// The target mode: 0 = Follow cursor, 1 = Locked point,
+    /// 2 = Sequence of points (0.8.0; replaces the pre-0.8 lock flag).
+    static TARGET_MODE: AtomicU32 = AtomicU32::new(0);
+    /// The persistent lock point (crosshair-picked, a slot, or the
+    /// other-monitor preset) and whether one is set. Persisted.
     static LOCK_X: AtomicI32 = AtomicI32::new(0);
     static LOCK_Y: AtomicI32 = AtomicI32::new(0);
     static LOCK_SET: AtomicBool = AtomicBool::new(false);
+    /// Window-relative lock: while on and the picked window is alive,
+    /// the lock point follows it at this offset from its top-left.
+    /// The window handle itself is matched live, never persisted.
+    static LOCK_REL: AtomicBool = AtomicBool::new(false);
+    static LOCK_RX: AtomicI32 = AtomicI32::new(0);
+    static LOCK_RY: AtomicI32 = AtomicI32::new(0);
+    static LOCK_HWND: AtomicI32 = AtomicI32::new(0);
+    /// The fallback lock point captured when a run starts with no
+    /// persistent point set (the pre-0.8 behaviour), per run only.
+    static RUN_X: AtomicI32 = AtomicI32::new(0);
+    static RUN_Y: AtomicI32 = AtomicI32::new(0);
+    static RUN_SET: AtomicBool = AtomicBool::new(false);
+    /// The multi-point sequence: points and how many are in use,
+    /// plus the rotation index (reset when a run starts).
+    static SEQ_COUNT: AtomicU32 = AtomicU32::new(0);
+    static SEQ_X: [AtomicI32; 4] = [
+        AtomicI32::new(0),
+        AtomicI32::new(0),
+        AtomicI32::new(0),
+        AtomicI32::new(0),
+    ];
+    static SEQ_Y: [AtomicI32; 4] = [
+        AtomicI32::new(0),
+        AtomicI32::new(0),
+        AtomicI32::new(0),
+        AtomicI32::new(0),
+    ];
+    static SEQ_IDX: AtomicU32 = AtomicU32::new(0);
+    /// Three named target slots (points + names; names behind a lock
+    /// because they are Strings).
+    static SLOT_X: [AtomicI32; 3] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+    static SLOT_Y: [AtomicI32; 3] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+    static SLOT_SET: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    static SLOT_NAMES: OnceLock<Mutex<[String; 3]>> = OnceLock::new();
+    /// Click offset from the cursor/lock point, in pixels.
+    static OFFSET_X: AtomicI32 = AtomicI32::new(0);
+    static OFFSET_Y: AtomicI32 = AtomicI32::new(0);
+    /// The pixel check: click only while the pixel at the click
+    /// point matches the sampled colour (packed 0xRRGGBB).
+    static PIXEL_CHECK: AtomicBool = AtomicBool::new(false);
+    static PIXEL_SET: AtomicBool = AtomicBool::new(false);
+    static PIXEL_RGB: AtomicU32 = AtomicU32::new(0);
+    static PIXEL_TOL: AtomicU32 = AtomicU32::new(DEFAULT_PIXEL_TOL);
+    /// The region guard: stop the run when the patch of screen
+    /// around the click point changes. The baseline signature is
+    /// sampled at the run's first cycle.
+    static REGION_GUARD: AtomicBool = AtomicBool::new(false);
+    static REGION_BASE: OnceLock<Mutex<Option<[u32; 64]>>> = OnceLock::new();
+    /// Where the region baseline was sampled in Follow mode (the
+    /// region is a fixed patch of screen, even when clicks follow
+    /// the cursor).
+    static REGION_AX: AtomicI32 = AtomicI32::new(0);
+    static REGION_AY: AtomicI32 = AtomicI32::new(0);
+    static REGION_ANCHOR_SET: AtomicBool = AtomicBool::new(false);
+    /// The settings window's current page (0 = Clicking, 1 = Action,
+    /// 2 = Targeting) and its paged controls' handles.
+    static CURRENT_PAGE: AtomicU32 = AtomicU32::new(0);
+    static PAGE_CONTROLS: OnceLock<Mutex<Vec<(i32, u32)>>> = OnceLock::new();
     /// Auto-stop limit in clicks per run; 0 = no limit.
     static LIMIT_CLICKS: AtomicU32 = AtomicU32::new(0);
     /// Clicks sent in the current run (reset on every activation).
@@ -339,15 +449,46 @@ mod win {
         }
     }
 
+    fn target_u32(t: TargetMode) -> u32 {
+        match t {
+            TargetMode::Follow => 0,
+            TargetMode::Locked => 1,
+            TargetMode::Sequence => 2,
+        }
+    }
+
+    fn target_mode() -> TargetMode {
+        match TARGET_MODE.load(Ordering::SeqCst) {
+            1 => TargetMode::Locked,
+            2 => TargetMode::Sequence,
+            _ => TargetMode::Follow,
+        }
+    }
+
+    fn slot_names() -> &'static Mutex<[String; 3]> {
+        SLOT_NAMES.get_or_init(|| Mutex::new([String::new(), String::new(), String::new()]))
+    }
+
+    fn region_base() -> &'static Mutex<Option<[u32; 64]>> {
+        REGION_BASE.get_or_init(|| Mutex::new(None))
+    }
+
+    fn page_controls() -> &'static Mutex<Vec<(i32, u32)>> {
+        PAGE_CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
     /// The live settings as a `Config`, for persisting after a change.
     fn current_config() -> Config {
+        let names = slot_names()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Config {
             keybind_vk: KEYBIND_VK.load(Ordering::SeqCst),
             interval_ms: INTERVAL_MS.load(Ordering::SeqCst),
             button: current_button(),
             jitter: JITTER_ON.load(Ordering::SeqCst),
             mode: current_mode(),
-            lock_position: LOCK_POS.load(Ordering::SeqCst),
+            lock_position: target_mode() != TargetMode::Follow,
             limit_clicks: LIMIT_CLICKS.load(Ordering::SeqCst),
             start_on_launch: START_ON_LAUNCH.load(Ordering::SeqCst),
             action: current_action(),
@@ -367,6 +508,27 @@ mod win {
             ramp: RAMP_ON.load(Ordering::SeqCst),
             ramp_to_ms: RAMP_TO_MS.load(Ordering::SeqCst),
             ramp_seconds: RAMP_SECONDS.load(Ordering::SeqCst),
+            target: target_mode(),
+            lock_x: LOCK_X.load(Ordering::SeqCst),
+            lock_y: LOCK_Y.load(Ordering::SeqCst),
+            lock_set: LOCK_SET.load(Ordering::SeqCst),
+            lock_rel: LOCK_REL.load(Ordering::SeqCst),
+            lock_rx: LOCK_RX.load(Ordering::SeqCst),
+            lock_ry: LOCK_RY.load(Ordering::SeqCst),
+            seq_count: SEQ_COUNT.load(Ordering::SeqCst),
+            seq_x: std::array::from_fn(|i| SEQ_X[i].load(Ordering::SeqCst)),
+            seq_y: std::array::from_fn(|i| SEQ_Y[i].load(Ordering::SeqCst)),
+            slot_x: std::array::from_fn(|i| SLOT_X[i].load(Ordering::SeqCst)),
+            slot_y: std::array::from_fn(|i| SLOT_Y[i].load(Ordering::SeqCst)),
+            slot_set: std::array::from_fn(|i| SLOT_SET[i].load(Ordering::SeqCst)),
+            slot_names: names.clone(),
+            offset_x: OFFSET_X.load(Ordering::SeqCst),
+            offset_y: OFFSET_Y.load(Ordering::SeqCst),
+            pixel_check: PIXEL_CHECK.load(Ordering::SeqCst),
+            pixel_set: PIXEL_SET.load(Ordering::SeqCst),
+            pixel_rgb: PIXEL_RGB.load(Ordering::SeqCst),
+            pixel_tol: PIXEL_TOL.load(Ordering::SeqCst),
+            region_guard: REGION_GUARD.load(Ordering::SeqCst),
         }
     }
 
@@ -412,14 +574,90 @@ mod win {
         }
     }
 
-    /// Send one physical click of `btn`, honouring the locked target
-    /// and the configured button-down duration (`press_ms`; 0 sends
-    /// down+up as one batch, as always).
-    fn click_once(btn: ClickButton) {
+    /// The cursor's current position, if it can be read.
+    fn cursor_pos() -> Option<(i32, i32)> {
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                Some((pt.x, pt.y))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The locked point, resolved live: the persistent point when one
+    /// is set (following its window while window-relative is on and
+    /// that window is alive), else the point captured when the run
+    /// started, else wherever the cursor is now.
+    fn locked_point() -> (i32, i32) {
+        if LOCK_SET.load(Ordering::SeqCst) {
+            let hwnd_raw = LOCK_HWND.load(Ordering::SeqCst);
+            if LOCK_REL.load(Ordering::SeqCst) && hwnd_raw != 0 {
+                unsafe {
+                    let hwnd = HWND(hwnd_raw as isize as *mut c_void);
+                    if IsWindow(Some(hwnd)).as_bool() {
+                        let mut rc = RECT::default();
+                        if GetWindowRect(hwnd, &mut rc).is_ok() {
+                            return (
+                                rc.left + LOCK_RX.load(Ordering::SeqCst),
+                                rc.top + LOCK_RY.load(Ordering::SeqCst),
+                            );
+                        }
+                    }
+                }
+            }
+            (LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst))
+        } else if RUN_SET.load(Ordering::SeqCst) {
+            (RUN_X.load(Ordering::SeqCst), RUN_Y.load(Ordering::SeqCst))
+        } else {
+            cursor_pos().unwrap_or((0, 0))
+        }
+    }
+
+    /// The point this cycle acts on, or `None` to act at the cursor.
+    /// The configured offset applies to every fixed point; in Follow
+    /// mode with an offset set, the point is the cursor plus the
+    /// offset (the click darts there and back, like a locked click).
+    fn cycle_point() -> Option<(i32, i32)> {
+        let ox = OFFSET_X.load(Ordering::SeqCst);
+        let oy = OFFSET_Y.load(Ordering::SeqCst);
+        match target_mode() {
+            TargetMode::Follow => {
+                if ox == 0 && oy == 0 {
+                    None
+                } else {
+                    cursor_pos().map(|(x, y)| (x + ox, y + oy))
+                }
+            }
+            TargetMode::Locked => {
+                let (x, y) = locked_point();
+                Some((x + ox, y + oy))
+            }
+            TargetMode::Sequence => {
+                let n = SEQ_COUNT.load(Ordering::SeqCst);
+                if n == 0 {
+                    None
+                } else {
+                    let i = (SEQ_IDX.load(Ordering::SeqCst) % n) as usize;
+                    Some((
+                        SEQ_X[i].load(Ordering::SeqCst) + ox,
+                        SEQ_Y[i].load(Ordering::SeqCst) + oy,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Send one physical click of `btn` — at `point` when the cycle
+    /// resolved one, else at the cursor — honouring the configured
+    /// button-down duration (`press_ms`; 0 sends down+up as one
+    /// batch, as always).
+    fn click_once(btn: ClickButton, point: Option<(i32, i32)>) {
         let (down, up) = button_flags(btn);
         let press = PRESS_MS.load(Ordering::SeqCst);
-        if LOCK_POS.load(Ordering::SeqCst) && LOCK_SET.load(Ordering::SeqCst) {
-            click_once_locked(down, up, press);
+        if let Some((x, y)) = point {
+            click_once_at(down, up, press, x, y);
         } else if press == 0 {
             let inputs = [mouse_input(0, 0, down), mouse_input(0, 0, up)];
             unsafe {
@@ -444,12 +682,12 @@ mod win {
         RUN_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Click at the locked point, then put the cursor back where the
+    /// Click at a fixed point, then put the cursor back where the
     /// user left it. With no press duration this is one SendInput
     /// batch, so the pointer only leaves for the instant of the click;
     /// with a press duration the button-down batch goes first, the
     /// duration elapses, then the release + restore batch follows.
-    fn click_once_locked(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS, press: u32) {
+    fn click_once_at(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS, press: u32, tx: i32, ty: i32) {
         unsafe {
             let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -462,7 +700,7 @@ mod win {
                     MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 )
             };
-            let target = abs_to(LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst));
+            let target = abs_to(tx, ty);
             let size = std::mem::size_of::<INPUT>() as i32;
             let mut cur = POINT::default();
             if GetCursorPos(&mut cur).is_ok() {
@@ -507,18 +745,18 @@ mod win {
         RUN_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One Scroll cycle: wheel ticks at the cursor — or, with a locked
-    /// target, a dart to the lock point, the ticks, and a dart back,
-    /// in one batch (the wheel goes to the window under the pointer).
-    fn scroll_once() {
+    /// One Scroll cycle: wheel ticks at the cursor — or, when the
+    /// cycle resolved a point, a dart to it, the ticks, and a dart
+    /// back, in one batch (the wheel goes to the window under the
+    /// pointer).
+    fn scroll_once(point: Option<(i32, i32)>) {
         let amt = SCROLL_AMT.load(Ordering::SeqCst);
         let size = std::mem::size_of::<INPUT>() as i32;
         unsafe {
             let mut wheel = mouse_input(0, 0, MOUSEEVENTF_WHEEL);
             wheel.Anonymous.mi.mouseData = (amt * 120) as u32; // WHEEL_DELTA per notch
-            if LOCK_POS.load(Ordering::SeqCst) && LOCK_SET.load(Ordering::SeqCst) {
-                let target =
-                    abs_move_input(LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst));
+            if let Some((x, y)) = point {
+                let target = abs_move_input(x, y);
                 let mut cur = POINT::default();
                 if GetCursorPos(&mut cur).is_ok() {
                     let back = abs_move_input(cur.x, cur.y);
@@ -531,6 +769,129 @@ mod win {
             }
         }
         count_action();
+    }
+
+    /// Convert a GDI `COLORREF` (`0x00BBGGRR`) to packed `0xRRGGBB`.
+    fn rgb_of(c: COLORREF) -> u32 {
+        let r = c.0 & 0xFF;
+        let g = (c.0 >> 8) & 0xFF;
+        let b = (c.0 >> 16) & 0xFF;
+        (r << 16) | (g << 8) | b
+    }
+
+    /// Read one screen pixel as packed `0xRRGGBB`; `None` when the
+    /// read fails (`GetPixel` returns `CLR_INVALID`, e.g. the point
+    /// is off-screen).
+    fn sample_pixel(x: i32, y: i32) -> Option<u32> {
+        unsafe {
+            let dc: HDC = GetDC(None);
+            if dc.0.is_null() {
+                return None;
+            }
+            let c = GetPixel(dc, x, y);
+            let _ = ReleaseDC(None, dc);
+            if c.0 == u32::MAX {
+                None
+            } else {
+                Some(rgb_of(c))
+            }
+        }
+    }
+
+    /// The pixel check: while it is on (and a colour is sampled), a
+    /// cycle may act only while the pixel at its point still matches
+    /// the sampled colour within the tolerance.
+    fn pixel_allows(point: Option<(i32, i32)>) -> bool {
+        if !PIXEL_CHECK.load(Ordering::SeqCst) || !PIXEL_SET.load(Ordering::SeqCst) {
+            return true;
+        }
+        let (x, y) = match point {
+            Some(p) => p,
+            None => match cursor_pos() {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+        match sample_pixel(x, y) {
+            Some(rgb) => colour_matches(
+                rgb,
+                PIXEL_RGB.load(Ordering::SeqCst),
+                PIXEL_TOL.load(Ordering::SeqCst),
+            ),
+            None => false,
+        }
+    }
+
+    /// Sample an 8×8 grid of pixels (±14 px around the point, every
+    /// 4 px) as a region signature. Unreadable pixels read as black.
+    fn sample_region(cx: i32, cy: i32) -> [u32; 64] {
+        let mut out = [0u32; 64];
+        unsafe {
+            let dc: HDC = GetDC(None);
+            if dc.0.is_null() {
+                return out;
+            }
+            let mut i = 0;
+            for gy in 0..8 {
+                for gx in 0..8 {
+                    let c = GetPixel(dc, cx - 14 + gx * 4, cy - 14 + gy * 4);
+                    out[i] = if c.0 == u32::MAX { 0 } else { rgb_of(c) };
+                    i += 1;
+                }
+            }
+            let _ = ReleaseDC(None, dc);
+        }
+        out
+    }
+
+    /// The region guard: the first call of a run samples the
+    /// baseline; later calls report whether the region around the
+    /// point has changed since. In Follow mode the patch anchors at
+    /// the cursor position of that first call — the region is a
+    /// fixed patch of screen even when clicks follow the cursor.
+    fn region_tripped(point: Option<(i32, i32)>) -> bool {
+        if !REGION_GUARD.load(Ordering::SeqCst) {
+            return false;
+        }
+        let (x, y) = match point {
+            Some(p) => p,
+            None => {
+                if REGION_ANCHOR_SET.load(Ordering::SeqCst) {
+                    (
+                        REGION_AX.load(Ordering::SeqCst),
+                        REGION_AY.load(Ordering::SeqCst),
+                    )
+                } else {
+                    match cursor_pos() {
+                        Some(p) => {
+                            REGION_AX.store(p.0, Ordering::SeqCst);
+                            REGION_AY.store(p.1, Ordering::SeqCst);
+                            REGION_ANCHOR_SET.store(true, Ordering::SeqCst);
+                            p
+                        }
+                        None => return false,
+                    }
+                }
+            }
+        };
+        let now = sample_region(x, y);
+        let mut base = region_base()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *base {
+            None => {
+                *base = Some(now);
+                false
+            }
+            Some(b) => region_changed(&b, &now),
+        }
+    }
+
+    /// Stop clicking because the watched region changed, and tell
+    /// the UI thread so it can settle the tray indicator.
+    fn trip_region() {
+        lock_engine().clicking = false;
+        post_main(WM_APP_REGION);
     }
 
     fn key_input(vk: u32, up: bool) -> INPUT {
@@ -601,15 +962,39 @@ mod win {
         count_action();
     }
 
+    /// One scheduled cycle, with the slice-3 guards applied first:
+    /// the region guard may stop the run, and the pixel check may
+    /// skip the cycle (silently — the run continues). Both apply
+    /// only to the point-acting actions (clicks and scroll); Key and
+    /// Drag cycles have no target pixel to watch.
+    fn run_cycle() {
+        let action = current_action();
+        let pointed = action.is_click_action() || action == ClickAction::Scroll;
+        let point = if pointed { cycle_point() } else { None };
+        if pointed {
+            if region_tripped(point) {
+                trip_region();
+                return;
+            }
+            if !pixel_allows(point) {
+                return;
+            }
+        }
+        perform_cycle(point);
+        if pointed && target_mode() == TargetMode::Sequence {
+            SEQ_IDX.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// One activation cycle, dispatched on the configured action.
     /// The click actions (single, double, burst of clicks spaced by
     /// the burst gap) stop early if clicking was switched off, the
     /// failsafe trips, or the run hits its auto-stop limit — a long
     /// burst never outlives any of them. The clicker's own limit
     /// check settles the stop afterwards.
-    fn perform_cycle() {
+    fn perform_cycle(point: Option<(i32, i32)>) {
         match current_action() {
-            ClickAction::Scroll => return scroll_once(),
+            ClickAction::Scroll => return scroll_once(point),
             ClickAction::Key => return key_once(),
             ClickAction::Drag => {
                 if DRAG_SET.load(Ordering::SeqCst) {
@@ -641,7 +1026,7 @@ mod win {
                 ALTERNATE.load(Ordering::SeqCst),
                 RUN_COUNT.load(Ordering::Relaxed),
             );
-            click_once(btn);
+            click_once(btn, point);
             if limit_reached() {
                 return;
             }
@@ -665,15 +1050,13 @@ mod win {
         }
     }
 
-    /// Capture the cursor as the lock point for this run.
+    /// Capture the cursor as this run's fallback lock point (used
+    /// for a Locked run when no persistent lock point is set).
     fn capture_lock_point() {
-        unsafe {
-            let mut pt = POINT::default();
-            if GetCursorPos(&mut pt).is_ok() {
-                LOCK_X.store(pt.x, Ordering::SeqCst);
-                LOCK_Y.store(pt.y, Ordering::SeqCst);
-                LOCK_SET.store(true, Ordering::SeqCst);
-            }
+        if let Some((x, y)) = cursor_pos() {
+            RUN_X.store(x, Ordering::SeqCst);
+            RUN_Y.store(y, Ordering::SeqCst);
+            RUN_SET.store(true, Ordering::SeqCst);
         }
     }
 
@@ -841,6 +1224,12 @@ mod win {
             if !lock_engine().is_clicking_now() {
                 deadline = None;
                 run_start = None;
+                // A stopped run forgets its region baseline; the
+                // next run samples a fresh one.
+                *region_base()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                REGION_ANCHOR_SET.store(false, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -865,12 +1254,12 @@ mod win {
                     if run_start.is_none() {
                         run_start = Some(Instant::now());
                     }
-                    perform_cycle();
+                    run_cycle();
                     deadline = Some(Instant::now() + effective_interval(&mut rng, run_start));
                 }
                 Some(d) => {
                     if Instant::now() >= d {
-                        perform_cycle();
+                        run_cycle();
                         deadline = Some(next_click_deadline(
                             d,
                             effective_interval(&mut rng, run_start),
@@ -1197,10 +1586,12 @@ mod win {
             }
             a => a.label().to_string(),
         };
-        let target = if LOCK_POS.load(Ordering::SeqCst) {
-            "Locked position"
-        } else {
-            "Follow cursor"
+        let target = match target_mode() {
+            TargetMode::Locked => "Locked position".to_string(),
+            TargetMode::Sequence => {
+                format!("Sequence ({} points)", SEQ_COUNT.load(Ordering::SeqCst))
+            }
+            TargetMode::Follow => "Follow cursor".to_string(),
         };
         let text = wide(&format!(
             "TrayClick {}\r\n\r\n\
@@ -1516,6 +1907,300 @@ mod win {
         }
     }
 
+    // ---------- Crosshair point-pick overlay ----------
+
+    /// What the pick overlay is capturing: 0 = one lock point,
+    /// 1 = a multi-point sequence (up to 4 clicks).
+    static PICK_MODE: AtomicU32 = AtomicU32::new(0);
+    /// Points picked so far in this overlay session (sequence mode).
+    static PICK_POINTS: OnceLock<Mutex<Vec<(i32, i32)>>> = OnceLock::new();
+    static PICK_LABEL: AtomicI32 = AtomicI32::new(0);
+
+    fn pick_points() -> &'static Mutex<Vec<(i32, i32)>> {
+        PICK_POINTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Commit the lock point just picked: store it, and remember the
+    /// window it was picked on when window-relative is on, so later
+    /// cycles can follow that window. Callers destroy the overlay
+    /// first, so `WindowFromPoint` sees the real window under the
+    /// point, not the overlay.
+    fn commit_lock_point(x: i32, y: i32) {
+        LOCK_X.store(x, Ordering::SeqCst);
+        LOCK_Y.store(y, Ordering::SeqCst);
+        LOCK_SET.store(true, Ordering::SeqCst);
+        if LOCK_REL.load(Ordering::SeqCst) {
+            unsafe {
+                let pt = POINT { x, y };
+                let hwnd = WindowFromPoint(pt);
+                if !hwnd.is_invalid() {
+                    let root = GetAncestor(hwnd, GET_ANCESTOR_FLAGS(2)); // GA_ROOT
+                    if !root.is_invalid() {
+                        let mut rc = RECT::default();
+                        if GetWindowRect(root, &mut rc).is_ok() {
+                            LOCK_HWND.store(root.0 as i32, Ordering::SeqCst);
+                            LOCK_RX.store(x - rc.left, Ordering::SeqCst);
+                            LOCK_RY.store(y - rc.top, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        }
+        save_config(current_config());
+    }
+
+    /// Commit the sequence points picked so far (at least one).
+    fn commit_sequence() {
+        let points = pick_points()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let n = points.len().min(4);
+        for i in 0..n {
+            SEQ_X[i].store(points[i].0, Ordering::SeqCst);
+            SEQ_Y[i].store(points[i].1, Ordering::SeqCst);
+        }
+        SEQ_COUNT.store(n as u32, Ordering::SeqCst);
+        save_config(current_config());
+    }
+
+    unsafe extern "system" fn pick_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_LBUTTONDOWN => {
+                unsafe {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        if PICK_MODE.load(Ordering::SeqCst) == 0 {
+                            // Destroy first: the window-relative
+                            // commit below looks through the point,
+                            // and it must not find this overlay.
+                            let _ = DestroyWindow(hwnd);
+                            commit_lock_point(pt.x, pt.y);
+                        } else {
+                            let mut points = pick_points()
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if points.len() < 4 {
+                                points.push((pt.x, pt.y));
+                                let count = points.len();
+                                let label_raw = PICK_LABEL.load(Ordering::SeqCst);
+                                if label_raw != 0 {
+                                    let label = HWND(label_raw as isize as *mut c_void);
+                                    let t = wide(&format!(
+                                        "Point {count} set. Click another (up to 4), or right-click to finish. Esc cancels."
+                                    ));
+                                    let _ = SetWindowTextW(label, PCWSTR(t.as_ptr()));
+                                }
+                                if count >= 4 {
+                                    drop(points);
+                                    commit_sequence();
+                                    let _ = DestroyWindow(hwnd);
+                                }
+                            }
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                if PICK_MODE.load(Ordering::SeqCst) == 1 {
+                    let has_points = !pick_points()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty();
+                    if has_points {
+                        commit_sequence();
+                        unsafe {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN => {
+                if wparam.0 as u32 == VK_ESCAPE_CODE {
+                    let _ = DestroyWindow(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC => {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+                SetTextColor(hdc, COLORREF(0x00F2F2F2));
+                SetBkMode(hdc, TRANSPARENT);
+                LRESULT(dialog_bg_brush().0 as isize)
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                DIALOG_OPEN.store(false, Ordering::SeqCst);
+                RESYNC_DETECTOR.store(true, Ordering::SeqCst);
+                PICK_LABEL.store(0, Ordering::SeqCst);
+                let mut points = pick_points()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                points.clear();
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Cover the virtual screen with a dark crosshair overlay and
+    /// record the user's clicks as the lock point (one click) or the
+    /// multi-point sequence (up to four, right-click finishes early).
+    /// Opened from the settings window (which closes first, so no
+    /// dialog is up); Esc cancels without changing anything.
+    fn open_pick_overlay(parent: HWND, for_sequence: bool) {
+        if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+            return; // a dialog is already open
+        }
+        PICK_MODE.store(if for_sequence { 1 } else { 0 }, Ordering::SeqCst);
+        pick_points()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        unsafe {
+            let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+            static REGISTERED: AtomicBool = AtomicBool::new(false);
+            if !REGISTERED.swap(true, Ordering::SeqCst) {
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(pick_wndproc),
+                    hInstance: instance.into(),
+                    hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
+                    hbrBackground: CreateSolidBrush(COLORREF(0x00181818)),
+                    lpszClassName: w!("TrayClickPointPick"),
+                    ..Default::default()
+                };
+                RegisterClassW(&wc);
+            }
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let title = if for_sequence {
+                w!("TrayClick — Set Sequence Points")
+            } else {
+                w!("TrayClick — Pick Lock Point")
+            };
+            let hwnd = match CreateWindowExW(
+                WINDOW_EX_STYLE(0x0000_0008), // WS_EX_TOPMOST
+                w!("TrayClickPointPick"),
+                title,
+                WS_POPUP | WS_VISIBLE,
+                vx,
+                vy,
+                vw,
+                vh,
+                Some(parent),
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    DIALOG_OPEN.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            let label = wide(if for_sequence {
+                "Click point 1 of up to 4 — right-click to finish. Esc cancels."
+            } else {
+                "Click anywhere to set the lock point. Esc cancels."
+            });
+            if let Ok(lh) = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR(label.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                32,
+                32,
+                900,
+                30,
+                Some(hwnd),
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                PICK_LABEL.store(lh.0 as i32, Ordering::SeqCst);
+            }
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    // ---------- Other-monitor quick lock ----------
+
+    /// Collect this process's monitor rects (left, top, right, bottom).
+    fn monitor_rects() -> Vec<(i32, i32, i32, i32)> {
+        let mut rects: Vec<(i32, i32, i32, i32)> = Vec::new();
+        unsafe extern "system" fn cb(
+            _mon: HMONITOR,
+            _hdc: HDC,
+            rect: *mut RECT,
+            data: LPARAM,
+        ) -> windows::core::BOOL {
+            if rect.is_null() {
+                return windows::core::BOOL(1);
+            }
+            let rects = &mut *(data.0 as *mut Vec<(i32, i32, i32, i32)>);
+            let r = &*rect;
+            rects.push((r.left, r.top, r.right, r.bottom));
+            windows::core::BOOL(1)
+        }
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                None,
+                None,
+                Some(cb),
+                LPARAM(&mut rects as *mut Vec<(i32, i32, i32, i32)> as isize),
+            );
+        }
+        rects
+    }
+
+    /// Set the lock point to the centre of the first monitor that
+    /// does not contain the current lock point (or the cursor, when
+    /// no point is set), and switch the target to Locked. With one
+    /// monitor there is nowhere to jump — that just shows a note.
+    fn lock_other_monitor(hwnd: HWND) {
+        let current = if LOCK_SET.load(Ordering::SeqCst) {
+            (LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst))
+        } else {
+            match cursor_pos() {
+                Some(p) => p,
+                None => return,
+            }
+        };
+        match other_monitor_centre(&monitor_rects(), current) {
+            Some((x, y)) => {
+                LOCK_X.store(x, Ordering::SeqCst);
+                LOCK_Y.store(y, Ordering::SeqCst);
+                LOCK_SET.store(true, Ordering::SeqCst);
+                TARGET_MODE.store(target_u32(TargetMode::Locked), Ordering::SeqCst);
+                save_config(current_config());
+                relabel_interval_controls(hwnd);
+            }
+            None => unsafe {
+                let text =
+                    wide("Only one monitor was found, so there is no other monitor to lock to.");
+                let title = wide("TrayClick — Set Interval");
+                MessageBoxW(
+                    Some(hwnd),
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            },
+        }
+    }
+
     // ---------- Set Interval window ----------
 
     static INTERVAL_HWND: AtomicI32 = AtomicI32::new(0);
@@ -1595,6 +2280,33 @@ mod win {
                         let _ = DestroyWindow(hwnd);
                         open_drag_overlay(parent);
                     }
+                    ID_IV_PAGE_CLICK => show_page(hwnd, 0),
+                    ID_IV_PAGE_ACTION => show_page(hwnd, 1),
+                    ID_IV_PAGE_TARGET => show_page(hwnd, 2),
+                    ID_IV_PICK_LOCK => {
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        let _ = DestroyWindow(hwnd);
+                        open_pick_overlay(parent, false);
+                    }
+                    ID_IV_SEQ_SET => {
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        let _ = DestroyWindow(hwnd);
+                        open_pick_overlay(parent, true);
+                    }
+                    ID_IV_OTHER_MON => lock_other_monitor(hwnd),
+                    ID_IV_WINREL => apply_winrel(hwnd),
+                    ID_IV_REGION => apply_region(hwnd),
+                    ID_IV_SEQ_CLEAR => apply_seq_clear(hwnd),
+                    ID_IV_SLOT1_SAVE => apply_slot_save(hwnd, 0),
+                    ID_IV_SLOT2_SAVE => apply_slot_save(hwnd, 1),
+                    ID_IV_SLOT3_SAVE => apply_slot_save(hwnd, 2),
+                    ID_IV_SLOT1_USE => apply_slot_use(hwnd, 0),
+                    ID_IV_SLOT2_USE => apply_slot_use(hwnd, 1),
+                    ID_IV_SLOT3_USE => apply_slot_use(hwnd, 2),
+                    ID_IV_OFF_SET => apply_offset(hwnd),
+                    ID_IV_PIXEL => apply_pixel(hwnd),
+                    ID_IV_PIXEL_SAMPLE => apply_pixel_sample(hwnd),
+                    ID_IV_TOL_SET => apply_tol(hwnd),
                     // IDCANCEL (2) arrives when Esc is pressed via the
                     // dialog message loop.
                     2 => {
@@ -1645,12 +2357,8 @@ mod win {
         format!("Mode: {}", current_mode().label())
     }
 
-    fn pos_caption() -> &'static str {
-        if LOCK_POS.load(Ordering::SeqCst) {
-            "Position: Locked"
-        } else {
-            "Position: Follow"
-        }
+    fn pos_caption() -> String {
+        format!("Target: {}", target_mode().label())
     }
 
     fn launch_caption() -> &'static str {
@@ -1701,6 +2409,93 @@ mod win {
         }
     }
 
+    /// The settings window's outer height for a page (the Targeting
+    /// page is the tall one).
+    fn page_outer_height(page: u32) -> i32 {
+        match page {
+            2 => 580,
+            _ => 420,
+        }
+    }
+
+    fn page_caption(page: u32) -> String {
+        let name = match page {
+            0 => "Clicking",
+            1 => "Action",
+            _ => "Targeting",
+        };
+        if CURRENT_PAGE.load(Ordering::SeqCst) == page {
+            format!("✓ {name}")
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn pick_caption() -> String {
+        if LOCK_SET.load(Ordering::SeqCst) {
+            format!(
+                "Pick lock point ✓ ({}, {})",
+                LOCK_X.load(Ordering::SeqCst),
+                LOCK_Y.load(Ordering::SeqCst)
+            )
+        } else {
+            "Pick lock point…".to_string()
+        }
+    }
+
+    fn winrel_caption() -> &'static str {
+        if LOCK_REL.load(Ordering::SeqCst) {
+            "Window-relative: On"
+        } else {
+            "Window-relative: Off"
+        }
+    }
+
+    fn region_caption() -> &'static str {
+        if REGION_GUARD.load(Ordering::SeqCst) {
+            "Region guard: On"
+        } else {
+            "Region guard: Off"
+        }
+    }
+
+    fn seq_caption() -> String {
+        let n = SEQ_COUNT.load(Ordering::SeqCst);
+        if n > 0 {
+            format!("Set sequence ✓ ({n} points)")
+        } else {
+            "Set sequence points".to_string()
+        }
+    }
+
+    fn slot_coords_caption(i: usize) -> String {
+        if SLOT_SET[i].load(Ordering::SeqCst) {
+            format!(
+                "{}, {}",
+                SLOT_X[i].load(Ordering::SeqCst),
+                SLOT_Y[i].load(Ordering::SeqCst)
+            )
+        } else {
+            "— empty —".to_string()
+        }
+    }
+
+    fn pixel_caption() -> &'static str {
+        if PIXEL_CHECK.load(Ordering::SeqCst) {
+            "Pixel check: On"
+        } else {
+            "Pixel check: Off"
+        }
+    }
+
+    fn sample_caption() -> String {
+        if PIXEL_SET.load(Ordering::SeqCst) {
+            format!("Sampled #{:06X}", PIXEL_RGB.load(Ordering::SeqCst))
+        } else {
+            "Sample colour".to_string()
+        }
+    }
+
     /// Repaint the button-row and jitter captions after a change.
     fn relabel_interval_controls(hwnd: HWND) {
         unsafe {
@@ -1723,7 +2518,7 @@ mod win {
                 let _ = SetWindowTextW(mb, PCWSTR(t.as_ptr()));
             }
             if let Ok(pb) = GetDlgItem(Some(hwnd), ID_IV_POS as i32) {
-                let t = wide(pos_caption());
+                let t = wide(&pos_caption());
                 let _ = SetWindowTextW(pb, PCWSTR(t.as_ptr()));
             }
             if let Ok(lb) = GetDlgItem(Some(hwnd), ID_IV_LAUNCH as i32) {
@@ -1753,6 +2548,50 @@ mod win {
             if let Ok(rb) = GetDlgItem(Some(hwnd), ID_IV_RAMP as i32) {
                 let t = wide(ramp_caption());
                 let _ = SetWindowTextW(rb, PCWSTR(t.as_ptr()));
+            }
+            for (id, page) in [
+                (ID_IV_PAGE_CLICK, 0),
+                (ID_IV_PAGE_ACTION, 1),
+                (ID_IV_PAGE_TARGET, 2),
+            ] {
+                if let Ok(pb) = GetDlgItem(Some(hwnd), id as i32) {
+                    let t = wide(&page_caption(page));
+                    let _ = SetWindowTextW(pb, PCWSTR(t.as_ptr()));
+                }
+            }
+            if let Ok(pb) = GetDlgItem(Some(hwnd), ID_IV_PICK_LOCK as i32) {
+                let t = wide(&pick_caption());
+                let _ = SetWindowTextW(pb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(wb) = GetDlgItem(Some(hwnd), ID_IV_WINREL as i32) {
+                let t = wide(winrel_caption());
+                let _ = SetWindowTextW(wb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(gb) = GetDlgItem(Some(hwnd), ID_IV_REGION as i32) {
+                let t = wide(region_caption());
+                let _ = SetWindowTextW(gb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(sb) = GetDlgItem(Some(hwnd), ID_IV_SEQ_SET as i32) {
+                let t = wide(&seq_caption());
+                let _ = SetWindowTextW(sb, PCWSTR(t.as_ptr()));
+            }
+            for (id, i) in [
+                (ID_IV_SLOT1_COORDS, 0),
+                (ID_IV_SLOT2_COORDS, 1),
+                (ID_IV_SLOT3_COORDS, 2),
+            ] {
+                if let Ok(cb) = GetDlgItem(Some(hwnd), id as i32) {
+                    let t = wide(&slot_coords_caption(i));
+                    let _ = SetWindowTextW(cb, PCWSTR(t.as_ptr()));
+                }
+            }
+            if let Ok(xb) = GetDlgItem(Some(hwnd), ID_IV_PIXEL as i32) {
+                let t = wide(pixel_caption());
+                let _ = SetWindowTextW(xb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(sb) = GetDlgItem(Some(hwnd), ID_IV_PIXEL_SAMPLE as i32) {
+                let t = wide(&sample_caption());
+                let _ = SetWindowTextW(sb, PCWSTR(t.as_ptr()));
             }
         }
     }
@@ -1791,9 +2630,14 @@ mod win {
         }
     }
 
+    /// Cycle the target mode: Follow → Locked → Sequence → Follow.
     fn apply_pos(hwnd: HWND) {
-        let on = !LOCK_POS.load(Ordering::SeqCst);
-        LOCK_POS.store(on, Ordering::SeqCst);
+        let next = match target_mode() {
+            TargetMode::Follow => TargetMode::Locked,
+            TargetMode::Locked => TargetMode::Sequence,
+            TargetMode::Sequence => TargetMode::Follow,
+        };
+        TARGET_MODE.store(target_u32(next), Ordering::SeqCst);
         save_config(current_config());
         relabel_interval_controls(hwnd);
         unsafe {
@@ -1994,6 +2838,219 @@ mod win {
         }
     }
 
+    /// Read a free-text edit control (slot names allow letters and
+    /// spaces, so the numeric readers do not apply).
+    fn read_edit_text(hwnd: HWND, id: usize) -> String {
+        let Ok(edit) = (unsafe { GetDlgItem(Some(hwnd), id as i32) }) else {
+            return String::new();
+        };
+        let mut buf = [0u16; 40];
+        let n = unsafe { GetWindowTextW(edit, &mut buf) };
+        if n <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    fn warn(hwnd: HWND, msg: &str) {
+        let text = wide(msg);
+        let title = wide("TrayClick — Set Interval");
+        unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
+
+    fn apply_winrel(hwnd: HWND) {
+        let on = !LOCK_REL.load(Ordering::SeqCst);
+        LOCK_REL.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_region(hwnd: HWND) {
+        let on = !REGION_GUARD.load(Ordering::SeqCst);
+        REGION_GUARD.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_pixel(hwnd: HWND) {
+        let on = !PIXEL_CHECK.load(Ordering::SeqCst);
+        PIXEL_CHECK.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Sample the colour the pixel check watches: the pixel at the
+    /// lock point when one is resolved, else at the cursor. The
+    /// settings window is up when this runs, so in practice the
+    /// cursor is over this window — pick a lock point first, then
+    /// sample (the sample reads the lock point, under the window).
+    fn apply_pixel_sample(hwnd: HWND) {
+        let (x, y) = if LOCK_SET.load(Ordering::SeqCst) || target_mode() != TargetMode::Follow {
+            locked_point()
+        } else {
+            cursor_pos().unwrap_or((0, 0))
+        };
+        match sample_pixel(x, y) {
+            Some(rgb) => {
+                PIXEL_RGB.store(rgb, Ordering::SeqCst);
+                PIXEL_SET.store(true, Ordering::SeqCst);
+                save_config(current_config());
+                relabel_interval_controls(hwnd);
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+            None => warn(hwnd, "Could not read a pixel at that point."),
+        }
+    }
+
+    fn apply_tol(hwnd: HWND) {
+        match read_edit_u32(hwnd, ID_IV_TOL_EDIT) {
+            Some(n) if is_valid_pixel_tol(n) => {
+                PIXEL_TOL.store(n, Ordering::SeqCst);
+                save_config(current_config());
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+            _ => warn(hwnd, "Tolerance: a whole number from 0 to 64."),
+        }
+    }
+
+    fn apply_offset(hwnd: HWND) {
+        let x = read_edit_i32(hwnd, ID_IV_OFF_X_EDIT);
+        let y = read_edit_i32(hwnd, ID_IV_OFF_Y_EDIT);
+        let valid = matches!(x, Some(v) if is_valid_offset(v))
+            && matches!(y, Some(v) if is_valid_offset(v));
+        if valid {
+            OFFSET_X.store(x.unwrap_or_default(), Ordering::SeqCst);
+            OFFSET_Y.store(y.unwrap_or_default(), Ordering::SeqCst);
+            save_config(current_config());
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+        } else {
+            warn(hwnd, "Offset: whole numbers from -200 to 200 on each axis.");
+        }
+    }
+
+    fn apply_seq_clear(hwnd: HWND) {
+        SEQ_COUNT.store(0, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    const SLOT_NAME_IDS: [usize; 3] = [ID_IV_SLOT1_NAME, ID_IV_SLOT2_NAME, ID_IV_SLOT3_NAME];
+
+    /// Save a slot: the current lock point when one is set, else the
+    /// cursor position, under the (sanitized) name in its edit box.
+    fn apply_slot_save(hwnd: HWND, i: usize) {
+        let point = if LOCK_SET.load(Ordering::SeqCst) {
+            Some((LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst)))
+        } else {
+            cursor_pos()
+        };
+        let Some((x, y)) = point else { return };
+        let name = sanitize_slot_name(&read_edit_text(hwnd, SLOT_NAME_IDS[i]));
+        SLOT_X[i].store(x, Ordering::SeqCst);
+        SLOT_Y[i].store(y, Ordering::SeqCst);
+        SLOT_SET[i].store(true, Ordering::SeqCst);
+        {
+            let mut names = slot_names()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            names[i] = name.clone();
+        }
+        save_config(current_config());
+        // Show the sanitized name back, so the box always matches
+        // what is stored.
+        unsafe {
+            if let Ok(edit) = GetDlgItem(Some(hwnd), SLOT_NAME_IDS[i] as i32) {
+                let t = wide(&name);
+                let _ = SetWindowTextW(edit, PCWSTR(t.as_ptr()));
+            }
+            let _ = SetFocus(Some(hwnd));
+        }
+        relabel_interval_controls(hwnd);
+    }
+
+    /// Use a slot: it becomes the lock point and the target switches
+    /// to Locked. An empty slot just explains itself.
+    fn apply_slot_use(hwnd: HWND, i: usize) {
+        if !SLOT_SET[i].load(Ordering::SeqCst) {
+            warn(
+                hwnd,
+                "That slot is empty. Save the lock point (or the cursor position) into it first.",
+            );
+            return;
+        }
+        LOCK_X.store(SLOT_X[i].load(Ordering::SeqCst), Ordering::SeqCst);
+        LOCK_Y.store(SLOT_Y[i].load(Ordering::SeqCst), Ordering::SeqCst);
+        LOCK_SET.store(true, Ordering::SeqCst);
+        LOCK_REL.store(false, Ordering::SeqCst);
+        LOCK_HWND.store(0, Ordering::SeqCst);
+        TARGET_MODE.store(target_u32(TargetMode::Locked), Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Show one settings page: hide the other pages' controls, size
+    /// the window for the page, and park the footer at the bottom.
+    /// The window remembers its page across opens (item 49, partial —
+    /// remembering the window position itself lands in slice 7).
+    fn show_page(hwnd: HWND, page: u32) {
+        CURRENT_PAGE.store(page, Ordering::SeqCst);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                396,
+                page_outer_height(page),
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+            {
+                let controls = page_controls()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (raw, p) in controls.iter() {
+                    let h = HWND(*raw as isize as *mut c_void);
+                    let _ = ShowWindow(h, if *p == page { SW_SHOW } else { SW_HIDE });
+                }
+            }
+            if let Ok(footer) = GetDlgItem(Some(hwnd), ID_IV_FOOTER as i32) {
+                let mut rc = RECT::default();
+                if GetClientRect(hwnd, &mut rc).is_ok() {
+                    let _ = SetWindowPos(footer, None, 16, rc.bottom - 48, 348, 36, SWP_NOZORDER);
+                }
+            }
+        }
+        relabel_interval_controls(hwnd);
+    }
+
     fn open_interval_window(parent: HWND) {
         if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
             return; // a dialog is already open
@@ -2017,7 +3074,7 @@ mod win {
                 RegisterClassW(&wc);
             }
             let width = 396;
-            let height = 634;
+            let height = page_outer_height(CURRENT_PAGE.load(Ordering::SeqCst));
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = match CreateWindowExW(
@@ -2042,6 +3099,10 @@ mod win {
             };
             INTERVAL_HWND.store(hwnd.0 as i32, Ordering::SeqCst);
 
+            page_controls()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             let child = |class: PCWSTR,
                          text: &str,
                          style: WINDOW_STYLE,
@@ -2067,383 +3128,794 @@ mod win {
                     None,
                 )
             };
+            // A child that belongs to one settings page: registered
+            // so `show_page` can show/hide it with its page.
+            let child_p = |page: u32,
+                           class: PCWSTR,
+                           text: &str,
+                           style: WINDOW_STYLE,
+                           cx: i32,
+                           cy: i32,
+                           cw: i32,
+                           ch: i32,
+                           id: usize|
+             -> windows::core::Result<HWND> {
+                let r = child(class, text, style, cx, cy, cw, ch, id);
+                if let Ok(h) = &r {
+                    page_controls()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((h.0 as i32, page));
+                }
+                r
+            };
             let label_style = WS_CHILD | WS_VISIBLE;
+            let btn_style = WS_CHILD | WS_VISIBLE;
+            // WS_BORDER | ES_CENTER | ES_NUMBER on top of child/visible.
+            let edit_style =
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0080_0000 | 0x0000_0001 | 0x0000_2000);
+            // Signed edits (scroll notches, click offsets) cannot use
+            // ES_NUMBER — it refuses the minus key.
+            let edit_signed_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0080_0000 | 0x0000_0001);
+            // Free-text edits (slot names): border only.
+            let edit_text_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0080_0000);
+            // BS_DEFPUSHBUTTON (0x1) so Enter applies via the dialog loop.
+            let apply_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000_0001);
+
+            // Page tabs (always visible).
             let _ = child(
+                w!("BUTTON"),
+                &page_caption(0),
+                btn_style,
+                16,
+                8,
+                108,
+                28,
+                ID_IV_PAGE_CLICK,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                &page_caption(1),
+                btn_style,
+                132,
+                8,
+                108,
+                28,
+                ID_IV_PAGE_ACTION,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                &page_caption(2),
+                btn_style,
+                248,
+                8,
+                116,
+                28,
+                ID_IV_PAGE_TARGET,
+            );
+
+            // ----- Page 0: Clicking -----
+            let _ = child_p(
+                0,
                 w!("STATIC"),
                 "Interval between clicks (milliseconds):",
                 label_style,
                 16,
-                14,
+                48,
                 360,
                 20,
                 0,
             );
-            let btn_style = WS_CHILD | WS_VISIBLE;
-            let _ = child(w!("BUTTON"), "1 ms", btn_style, 16, 44, 80, 30, ID_IV_1MS);
-            let _ = child(
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "1 ms",
+                btn_style,
+                16,
+                78,
+                80,
+                30,
+                ID_IV_1MS,
+            );
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 "100 ms",
                 btn_style,
                 106,
-                44,
+                78,
                 80,
                 30,
                 ID_IV_100MS,
             );
-            // WS_BORDER | ES_CENTER | ES_NUMBER on top of child/visible.
-            let edit_style =
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0080_0000 | 0x0000_0001 | 0x0000_2000);
             let current = INTERVAL_MS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("EDIT"),
                 &current,
                 edit_style,
                 200,
-                44,
+                78,
                 76,
                 30,
                 ID_IV_EDIT,
             );
-            // BS_DEFPUSHBUTTON (0x1) so Enter applies via the dialog loop.
-            let apply_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000_0001);
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 "Apply",
                 apply_style,
                 290,
-                44,
+                78,
                 74,
                 30,
                 ID_IV_APPLY,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("STATIC"),
                 "Mouse button:",
                 label_style,
                 16,
-                88,
+                122,
                 360,
                 20,
                 0,
             );
             let cur_btn = current_button();
             let left_cap = button_caption(ClickButton::Left, cur_btn);
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 &left_cap,
                 btn_style,
                 16,
-                112,
+                146,
                 80,
                 30,
                 ID_IV_BTN_LEFT,
             );
             let right_cap = button_caption(ClickButton::Right, cur_btn);
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 &right_cap,
                 btn_style,
                 106,
-                112,
+                146,
                 80,
                 30,
                 ID_IV_BTN_RIGHT,
             );
             let middle_cap = button_caption(ClickButton::Middle, cur_btn);
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 &middle_cap,
                 btn_style,
                 196,
-                112,
+                146,
                 80,
                 30,
                 ID_IV_BTN_MIDDLE,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 jitter_caption(),
                 btn_style,
                 290,
-                112,
+                146,
                 74,
                 30,
                 ID_IV_JITTER,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("STATIC"),
                 "Mode and target:",
                 label_style,
                 16,
-                156,
+                190,
                 360,
                 20,
                 0,
             );
             let mode_cap = mode_caption();
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 &mode_cap,
                 btn_style,
                 16,
-                180,
+                214,
                 150,
                 30,
                 ID_IV_MODE,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
-                pos_caption(),
+                &pos_caption(),
                 btn_style,
                 176,
-                180,
+                214,
                 188,
                 30,
                 ID_IV_POS,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("STATIC"),
                 "Stop after (clicks, 0 = no limit):",
                 label_style,
                 16,
-                224,
+                258,
                 216,
                 20,
                 0,
             );
             let limit_now = LIMIT_CLICKS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("EDIT"),
                 &limit_now,
                 edit_style,
                 238,
-                218,
+                252,
                 62,
                 30,
                 ID_IV_LIMIT_EDIT,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 "Set",
                 btn_style,
                 308,
-                218,
+                252,
                 56,
                 30,
                 ID_IV_LIMIT_SET,
             );
-            let _ = child(
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 launch_caption(),
                 btn_style,
                 16,
-                256,
+                290,
                 348,
                 30,
                 ID_IV_LAUNCH,
             );
-            let _ = child(
+
+            // ----- Page 1: Action -----
+            let _ = child_p(
+                1,
                 w!("STATIC"),
                 "Click action:",
                 label_style,
                 16,
-                300,
+                48,
                 360,
                 20,
                 0,
             );
             let act_cap = action_caption();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 &act_cap,
                 btn_style,
                 16,
-                324,
+                72,
                 150,
                 30,
                 ID_IV_ACTION,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 alt_caption(),
                 btn_style,
                 176,
-                324,
+                72,
                 188,
                 30,
                 ID_IV_ALT,
             );
             let rep_cap = repeat_caption();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 &rep_cap,
                 btn_style,
                 16,
-                362,
+                110,
                 170,
                 30,
                 ID_IV_REPEAT,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 drag_caption(),
                 btn_style,
                 196,
-                362,
+                110,
                 168,
                 30,
                 ID_IV_DRAG,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("STATIC"),
                 "Burst count / gap / down (ms) / scroll notches:",
                 label_style,
                 16,
-                404,
+                152,
                 360,
                 20,
                 0,
             );
             let burst_now = BURST_CLICKS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &burst_now,
                 edit_style,
                 16,
-                428,
+                176,
                 52,
                 30,
                 ID_IV_BURST_EDIT,
             );
             let gap_now = BURST_GAP_MS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &gap_now,
                 edit_style,
                 76,
-                428,
+                176,
                 52,
                 30,
                 ID_IV_GAP_EDIT,
             );
             let press_now = PRESS_MS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &press_now,
                 edit_style,
                 136,
-                428,
+                176,
                 52,
                 30,
                 ID_IV_PRESS_EDIT,
             );
             let scroll_now = SCROLL_AMT.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &scroll_now,
-                edit_style,
+                edit_signed_style,
                 196,
-                428,
+                176,
                 52,
                 30,
                 ID_IV_SCROLL_EDIT,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 "Set",
                 btn_style,
                 256,
-                428,
+                176,
                 108,
                 30,
                 ID_IV_NUM_SET,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("STATIC"),
                 "Random interval and speed ramp:",
                 label_style,
                 16,
-                470,
+                218,
                 360,
                 20,
                 0,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 random_caption(),
                 btn_style,
                 16,
-                494,
+                242,
                 120,
                 30,
                 ID_IV_RANDOM,
             );
-            let _ = child(w!("STATIC"), "Max ms:", label_style, 144, 500, 52, 20, 0);
+            let _ = child_p(1, w!("STATIC"), "Max ms:", label_style, 144, 248, 52, 20, 0);
             let max_now = INTERVAL_MAX_MS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &max_now,
                 edit_style,
                 200,
-                494,
+                242,
                 56,
                 30,
                 ID_IV_MAX_EDIT,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 ramp_caption(),
                 btn_style,
                 264,
-                494,
+                242,
                 100,
                 30,
                 ID_IV_RAMP,
             );
-            let _ = child(w!("STATIC"), "Ramp to ms:", label_style, 16, 538, 68, 20, 0);
+            let _ = child_p(
+                1,
+                w!("STATIC"),
+                "Ramp to ms:",
+                label_style,
+                16,
+                286,
+                68,
+                20,
+                0,
+            );
             let to_now = RAMP_TO_MS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &to_now,
                 edit_style,
                 88,
-                532,
+                280,
                 56,
                 30,
                 ID_IV_RAMP_TO_EDIT,
             );
-            let _ = child(w!("STATIC"), "over secs:", label_style, 152, 538, 60, 20, 0);
+            let _ = child_p(
+                1,
+                w!("STATIC"),
+                "over secs:",
+                label_style,
+                152,
+                286,
+                60,
+                20,
+                0,
+            );
             let secs_now = RAMP_SECONDS.load(Ordering::SeqCst).to_string();
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("EDIT"),
                 &secs_now,
                 edit_style,
                 216,
-                532,
+                280,
                 52,
                 30,
                 ID_IV_RAMP_SECS_EDIT,
             );
-            let _ = child(
+            let _ = child_p(
+                1,
                 w!("BUTTON"),
                 "Set",
                 btn_style,
                 276,
-                532,
+                280,
                 88,
                 30,
                 ID_IV_TIMING_SET,
             );
-            let _ = child(
+
+            // ----- Page 2: Targeting -----
+            let _ = child_p(
+                2,
                 w!("STATIC"),
-                "Presets apply at once. Custom interval: type a value and click Apply (range 1–60000). Numbers apply with their Set buttons. Esc cancels.",
+                "Lock point (crosshair pick):",
                 label_style,
                 16,
-                574,
+                48,
                 360,
-                36,
+                20,
                 0,
             );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                &pick_caption(),
+                btn_style,
+                16,
+                72,
+                176,
+                30,
+                ID_IV_PICK_LOCK,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                "Other monitor centre",
+                btn_style,
+                196,
+                72,
+                168,
+                30,
+                ID_IV_OTHER_MON,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                winrel_caption(),
+                btn_style,
+                16,
+                110,
+                176,
+                30,
+                ID_IV_WINREL,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                region_caption(),
+                btn_style,
+                196,
+                110,
+                168,
+                30,
+                ID_IV_REGION,
+            );
+            let _ = child_p(
+                2,
+                w!("STATIC"),
+                "Multi-point sequence (clicks rotate through the points):",
+                label_style,
+                16,
+                148,
+                348,
+                20,
+                0,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                &seq_caption(),
+                btn_style,
+                16,
+                172,
+                240,
+                30,
+                ID_IV_SEQ_SET,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                "Clear",
+                btn_style,
+                264,
+                172,
+                100,
+                30,
+                ID_IV_SEQ_CLEAR,
+            );
+            let _ = child_p(
+                2,
+                w!("STATIC"),
+                "Click offset in pixels (cursor and lock points):",
+                label_style,
+                16,
+                210,
+                348,
+                20,
+                0,
+            );
+            let _ = child_p(2, w!("STATIC"), "X:", label_style, 16, 240, 20, 20, 0);
+            let off_x_now = OFFSET_X.load(Ordering::SeqCst).to_string();
+            let _ = child_p(
+                2,
+                w!("EDIT"),
+                &off_x_now,
+                edit_signed_style,
+                40,
+                234,
+                52,
+                30,
+                ID_IV_OFF_X_EDIT,
+            );
+            let _ = child_p(2, w!("STATIC"), "Y:", label_style, 100, 240, 20, 20, 0);
+            let off_y_now = OFFSET_Y.load(Ordering::SeqCst).to_string();
+            let _ = child_p(
+                2,
+                w!("EDIT"),
+                &off_y_now,
+                edit_signed_style,
+                124,
+                234,
+                52,
+                30,
+                ID_IV_OFF_Y_EDIT,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                "Set",
+                btn_style,
+                184,
+                234,
+                80,
+                30,
+                ID_IV_OFF_SET,
+            );
+            let _ = child_p(
+                2,
+                w!("STATIC"),
+                "-200..200",
+                label_style,
+                272,
+                240,
+                92,
+                20,
+                0,
+            );
+            let _ = child_p(
+                2,
+                w!("STATIC"),
+                "Named slots - Save stores the lock point (or cursor):",
+                label_style,
+                16,
+                272,
+                348,
+                20,
+                0,
+            );
+            let slot_name_ids = [ID_IV_SLOT1_NAME, ID_IV_SLOT2_NAME, ID_IV_SLOT3_NAME];
+            let slot_save_ids = [ID_IV_SLOT1_SAVE, ID_IV_SLOT2_SAVE, ID_IV_SLOT3_SAVE];
+            let slot_use_ids = [ID_IV_SLOT1_USE, ID_IV_SLOT2_USE, ID_IV_SLOT3_USE];
+            let slot_coords_ids = [ID_IV_SLOT1_COORDS, ID_IV_SLOT2_COORDS, ID_IV_SLOT3_COORDS];
+            let names_now = slot_names()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for i in 0..3 {
+                let sy = 296 + (i as i32) * 32;
+                let _ = child_p(
+                    2,
+                    w!("EDIT"),
+                    &names_now[i],
+                    edit_text_style,
+                    16,
+                    sy,
+                    128,
+                    28,
+                    slot_name_ids[i],
+                );
+                let _ = child_p(
+                    2,
+                    w!("STATIC"),
+                    &slot_coords_caption(i),
+                    label_style,
+                    152,
+                    sy + 5,
+                    100,
+                    20,
+                    slot_coords_ids[i],
+                );
+                let _ = child_p(
+                    2,
+                    w!("BUTTON"),
+                    "Save",
+                    btn_style,
+                    258,
+                    sy,
+                    50,
+                    28,
+                    slot_save_ids[i],
+                );
+                let _ = child_p(
+                    2,
+                    w!("BUTTON"),
+                    "Use",
+                    btn_style,
+                    312,
+                    sy,
+                    52,
+                    28,
+                    slot_use_ids[i],
+                );
+            }
+            let _ = child_p(
+                2,
+                w!("STATIC"),
+                "Pixel check - click only while the target pixel keeps its colour:",
+                label_style,
+                16,
+                400,
+                348,
+                20,
+                0,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                pixel_caption(),
+                btn_style,
+                16,
+                424,
+                176,
+                30,
+                ID_IV_PIXEL,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                &sample_caption(),
+                btn_style,
+                196,
+                424,
+                168,
+                30,
+                ID_IV_PIXEL_SAMPLE,
+            );
+            let _ = child_p(
+                2,
+                w!("STATIC"),
+                "Tolerance (0-64):",
+                label_style,
+                16,
+                468,
+                118,
+                20,
+                0,
+            );
+            let tol_now = PIXEL_TOL.load(Ordering::SeqCst).to_string();
+            let _ = child_p(
+                2,
+                w!("EDIT"),
+                &tol_now,
+                edit_style,
+                140,
+                462,
+                52,
+                30,
+                ID_IV_TOL_EDIT,
+            );
+            let _ = child_p(
+                2,
+                w!("BUTTON"),
+                "Set",
+                btn_style,
+                200,
+                462,
+                88,
+                30,
+                ID_IV_TOL_SET,
+            );
+
+            // Footer (always visible; show_page parks it at the bottom).
+            let _ = child(
+                w!("STATIC"),
+                "Tabs group the settings. Presets and toggles apply at once; numbers apply with their Set buttons. Esc closes.",
+                label_style,
+                16,
+                380,
+                348,
+                36,
+                ID_IV_FOOTER,
+            );
+            show_page(hwnd, CURRENT_PAGE.load(Ordering::SeqCst));
             let _ = SetFocus(Some(hwnd));
         }
     }
@@ -2475,6 +3947,11 @@ mod win {
                 refresh_indicator(hwnd);
                 LRESULT(0)
             }
+            m if m == WM_APP_REGION => {
+                // The region guard stopped the run; settle the icon.
+                refresh_indicator(hwnd);
+                LRESULT(0)
+            }
             WM_TRAYICON => {
                 let event = lparam.0 as u32;
                 if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
@@ -2486,11 +3963,18 @@ mod win {
                 lock_engine().press_keybind();
                 if lock_engine().is_clicking_now() {
                     RUN_COUNT.store(0, Ordering::Relaxed);
-                    if current_mode() == ClickMode::Click && LOCK_POS.load(Ordering::SeqCst) {
+                    SEQ_IDX.store(0, Ordering::SeqCst);
+                    RUN_SET.store(false, Ordering::SeqCst);
+                    // A Locked run with no persistent point falls
+                    // back to the position where it was started.
+                    if current_mode() == ClickMode::Click
+                        && target_mode() == TargetMode::Locked
+                        && !LOCK_SET.load(Ordering::SeqCst)
+                    {
                         capture_lock_point();
                     }
                 } else {
-                    LOCK_SET.store(false, Ordering::SeqCst);
+                    RUN_SET.store(false, Ordering::SeqCst);
                 }
                 refresh_indicator(hwnd);
                 LRESULT(0)
@@ -2581,7 +4065,33 @@ mod win {
         BUTTON.store(button_u32(cfg.button), Ordering::SeqCst);
         JITTER_ON.store(cfg.jitter, Ordering::SeqCst);
         MODE.store(mode_u32(cfg.mode), Ordering::SeqCst);
-        LOCK_POS.store(cfg.lock_position, Ordering::SeqCst);
+        TARGET_MODE.store(target_u32(cfg.target), Ordering::SeqCst);
+        LOCK_X.store(cfg.lock_x, Ordering::SeqCst);
+        LOCK_Y.store(cfg.lock_y, Ordering::SeqCst);
+        LOCK_SET.store(cfg.lock_set, Ordering::SeqCst);
+        LOCK_REL.store(cfg.lock_rel, Ordering::SeqCst);
+        LOCK_RX.store(cfg.lock_rx, Ordering::SeqCst);
+        LOCK_RY.store(cfg.lock_ry, Ordering::SeqCst);
+        SEQ_COUNT.store(cfg.seq_count, Ordering::SeqCst);
+        for i in 0..4 {
+            SEQ_X[i].store(cfg.seq_x[i], Ordering::SeqCst);
+            SEQ_Y[i].store(cfg.seq_y[i], Ordering::SeqCst);
+        }
+        for i in 0..3 {
+            SLOT_X[i].store(cfg.slot_x[i], Ordering::SeqCst);
+            SLOT_Y[i].store(cfg.slot_y[i], Ordering::SeqCst);
+            SLOT_SET[i].store(cfg.slot_set[i], Ordering::SeqCst);
+        }
+        *slot_names()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = cfg.slot_names.clone();
+        OFFSET_X.store(cfg.offset_x, Ordering::SeqCst);
+        OFFSET_Y.store(cfg.offset_y, Ordering::SeqCst);
+        PIXEL_CHECK.store(cfg.pixel_check, Ordering::SeqCst);
+        PIXEL_SET.store(cfg.pixel_set, Ordering::SeqCst);
+        PIXEL_RGB.store(cfg.pixel_rgb, Ordering::SeqCst);
+        PIXEL_TOL.store(cfg.pixel_tol, Ordering::SeqCst);
+        REGION_GUARD.store(cfg.region_guard, Ordering::SeqCst);
         LIMIT_CLICKS.store(cfg.limit_clicks, Ordering::SeqCst);
         START_ON_LAUNCH.store(cfg.start_on_launch, Ordering::SeqCst);
         ACTION.store(action_u32(cfg.action), Ordering::SeqCst);
@@ -2603,7 +4113,7 @@ mod win {
         RAMP_SECONDS.store(cfg.ramp_seconds, Ordering::SeqCst);
         if cfg.start_on_launch && cfg.mode == ClickMode::Click {
             lock_engine().clicking = true;
-            if cfg.lock_position {
+            if cfg.target == TargetMode::Locked && !cfg.lock_set {
                 capture_lock_point();
             }
         }
