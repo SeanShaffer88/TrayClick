@@ -96,13 +96,19 @@ impl ClickMode {
 }
 
 /// What one activation cycle sends (in Click mode): a single click, a
-/// double-click, or a burst of several clicks spaced by a gap.
+/// double-click, a burst of several clicks spaced by a gap, mouse-wheel
+/// scroll ticks, a repeated keystroke, or a drag between two points.
+/// The first three are the *click actions* — the only ones Hold mode
+/// and button alternation apply to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClickAction {
     #[default]
     Single,
     Double,
     Burst,
+    Scroll,
+    Key,
+    Drag,
 }
 
 impl ClickAction {
@@ -112,6 +118,9 @@ impl ClickAction {
             ClickAction::Single => "single",
             ClickAction::Double => "double",
             ClickAction::Burst => "burst",
+            ClickAction::Scroll => "scroll",
+            ClickAction::Key => "key",
+            ClickAction::Drag => "drag",
         }
     }
 
@@ -121,6 +130,9 @@ impl ClickAction {
             "single" => Some(ClickAction::Single),
             "double" => Some(ClickAction::Double),
             "burst" => Some(ClickAction::Burst),
+            "scroll" => Some(ClickAction::Scroll),
+            "key" => Some(ClickAction::Key),
+            "drag" => Some(ClickAction::Drag),
             _ => None,
         }
     }
@@ -131,8 +143,59 @@ impl ClickAction {
             ClickAction::Single => "Single",
             ClickAction::Double => "Double",
             ClickAction::Burst => "Burst",
+            ClickAction::Scroll => "Scroll",
+            ClickAction::Key => "Key",
+            ClickAction::Drag => "Drag",
         }
     }
+
+    /// True for the mouse-click actions (Single/Double/Burst) — the
+    /// ones Hold mode, alternation, and the button choice apply to.
+    pub fn is_click_action(&self) -> bool {
+        matches!(self, Self::Single | Self::Double | Self::Burst)
+    }
+}
+
+/// The default keystroke repeated by the Key action: Space.
+pub const DEFAULT_REPEAT_VK: u32 = 0x20;
+
+/// Wheel notches per Scroll cycle must be within ±10 and non-zero
+/// (positive scrolls up, negative down).
+pub fn is_valid_scroll_amount(n: i32) -> bool {
+    n != 0 && (-10..=10).contains(&n)
+}
+
+/// Whether `vk` is an extended key (navigation cluster, arrows, …)
+/// that needs `KEYEVENTF_EXTENDEDKEY` when synthesized.
+pub fn is_extended_key(vk: u32) -> bool {
+    matches!(
+        vk,
+        0x21..=0x2E // PgUp..Delete (incl. arrows, Home, End, Insert)
+            | 0x5B..=0x5D // Win keys, Apps
+            | 0x6F // Numpad divide
+            | 0xA3..=0xA5 // Right Ctrl/Alt
+            | 0x90 // Num Lock
+    )
+}
+
+/// The interval partway through a speed ramp: linear from `from_ms`
+/// to `to_ms` over `total_s` seconds, clamped at both ends. A total
+/// of 0 means the ramp is instant (always `to_ms`).
+pub fn ramped_interval_ms(from_ms: u32, to_ms: u32, elapsed_s: u64, total_s: u64) -> u32 {
+    if total_s == 0 || elapsed_s >= total_s {
+        return to_ms;
+    }
+    let from = from_ms as i64;
+    let to = to_ms as i64;
+    let v = from + (to - from) * (elapsed_s as i64) / (total_s as i64);
+    v.clamp(MIN_INTERVAL_MS as i64, MAX_INTERVAL_MS as i64) as u32
+}
+
+/// The longest ramp duration the config accepts (24 h).
+pub const MAX_RAMP_SECONDS: u32 = 86_400;
+
+pub fn is_valid_ramp_seconds(n: u32) -> bool {
+    (1..=MAX_RAMP_SECONDS).contains(&n)
 }
 
 /// Clicks per burst when the config does not say (and the burst default).
@@ -468,6 +531,18 @@ pub struct Config {
     pub burst_gap_ms: u32,
     pub press_ms: u32,
     pub alternate: bool,
+    pub scroll_amount: i32,
+    pub repeat_vk: u32,
+    pub drag_ax: i32,
+    pub drag_ay: i32,
+    pub drag_bx: i32,
+    pub drag_by: i32,
+    pub drag_set: bool,
+    pub random_interval: bool,
+    pub interval_max_ms: u32,
+    pub ramp: bool,
+    pub ramp_to_ms: u32,
+    pub ramp_seconds: u32,
 }
 
 impl Default for Config {
@@ -486,6 +561,18 @@ impl Default for Config {
             burst_gap_ms: DEFAULT_BURST_GAP_MS,
             press_ms: 0,
             alternate: false,
+            scroll_amount: 1,
+            repeat_vk: DEFAULT_REPEAT_VK,
+            drag_ax: 0,
+            drag_ay: 0,
+            drag_bx: 0,
+            drag_by: 0,
+            drag_set: false,
+            random_interval: false,
+            interval_max_ms: 0,
+            ramp: false,
+            ramp_to_ms: 0,
+            ramp_seconds: 60,
         }
     }
 }
@@ -500,6 +587,23 @@ fn json_u32(text: &str, key: &str) -> Option<u32> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// Read one signed-integer field out of the hand-rolled JSON object.
+fn json_i32(text: &str, key: &str) -> Option<i32> {
+    let start = text.find(key)? + key.len();
+    let rest = text[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let (neg, rest) = match rest.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let mag: i32 = digits.parse().ok()?;
+    Some(if neg { -mag } else { mag })
 }
 
 /// Read one string field out of the hand-rolled JSON object.
@@ -530,7 +634,7 @@ impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {}\n}}\n",
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {}\n}}\n",
             self.keybind_vk,
             self.interval_ms,
             self.button.as_str(),
@@ -543,7 +647,19 @@ impl Config {
             self.burst_clicks,
             self.burst_gap_ms,
             self.press_ms,
-            self.alternate
+            self.alternate,
+            self.scroll_amount,
+            self.repeat_vk,
+            self.drag_ax,
+            self.drag_ay,
+            self.drag_bx,
+            self.drag_by,
+            self.drag_set,
+            self.random_interval,
+            self.interval_max_ms,
+            self.ramp,
+            self.ramp_to_ms,
+            self.ramp_seconds
         )
     }
 
@@ -622,6 +738,60 @@ impl Config {
             None => 0,
         };
         let alternate = opt_bool(text, "\"alternate\"")?;
+        // Fields added in 0.7.0 (50-enhancement program, slice 2);
+        // absent in older files, defaults apply.
+        let scroll_amount = match json_i32(text, "\"scroll_amount\"") {
+            Some(n) => {
+                if !is_valid_scroll_amount(n) {
+                    return None;
+                }
+                n
+            }
+            None => 1,
+        };
+        let repeat_vk = match json_u32(text, "\"repeat_vk\"") {
+            Some(v) => {
+                if !is_valid_keybind(v) {
+                    return None;
+                }
+                v
+            }
+            None => DEFAULT_REPEAT_VK,
+        };
+        let drag_ax = opt_i32(text, "\"drag_ax\"")?;
+        let drag_ay = opt_i32(text, "\"drag_ay\"")?;
+        let drag_bx = opt_i32(text, "\"drag_bx\"")?;
+        let drag_by = opt_i32(text, "\"drag_by\"")?;
+        let drag_set = opt_bool(text, "\"drag_set\"")?;
+        let random_interval = opt_bool(text, "\"random_interval\"")?;
+        let interval_max_ms = match json_u32(text, "\"interval_max_ms\"") {
+            Some(n) => {
+                if n != 0 && !is_valid_interval(n) {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let ramp = opt_bool(text, "\"ramp\"")?;
+        let ramp_to_ms = match json_u32(text, "\"ramp_to_ms\"") {
+            Some(n) => {
+                if n != 0 && !is_valid_interval(n) {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let ramp_seconds = match json_u32(text, "\"ramp_seconds\"") {
+            Some(n) => {
+                if !is_valid_ramp_seconds(n) {
+                    return None;
+                }
+                n
+            }
+            None => 60,
+        };
         Some(Self {
             keybind_vk: vk,
             interval_ms,
@@ -636,7 +806,34 @@ impl Config {
             burst_gap_ms,
             press_ms,
             alternate,
+            scroll_amount,
+            repeat_vk,
+            drag_ax,
+            drag_ay,
+            drag_bx,
+            drag_by,
+            drag_set,
+            random_interval,
+            interval_max_ms,
+            ramp,
+            ramp_to_ms,
+            ramp_seconds,
         })
+    }
+}
+
+/// Read an optional signed-integer field: absent → `Some(0)`, present
+/// and valid → its value, present but garbled → `None`.
+fn opt_i32(text: &str, key: &str) -> Option<i32> {
+    match json_i32(text, key) {
+        Some(v) => Some(v),
+        None => {
+            if text.contains(key) {
+                None
+            } else {
+                Some(0)
+            }
+        }
     }
 }
 
@@ -749,9 +946,93 @@ mod tests {
             burst_gap_ms: 80,
             press_ms: 25,
             alternate: true,
+            scroll_amount: -3,
+            repeat_vk: 0x52, // R
+            drag_ax: -100,
+            drag_ay: 200,
+            drag_bx: 300,
+            drag_by: -400,
+            drag_set: true,
+            random_interval: true,
+            interval_max_ms: 500,
+            ramp: true,
+            ramp_to_ms: 20,
+            ramp_seconds: 120,
         };
         let json = cfg.to_json();
         assert_eq!(Config::from_json(&json), Some(cfg));
+    }
+
+    #[test]
+    fn config_from_060_gets_slice2_defaults() {
+        // A v0.6.0 config file has none of the slice-2 fields.
+        let cfg =
+            Config::from_json("{\"keybind_vk\": 117, \"action\": \"burst\", \"burst_clicks\": 4}")
+                .unwrap();
+        assert_eq!(cfg.scroll_amount, 1);
+        assert_eq!(cfg.repeat_vk, DEFAULT_REPEAT_VK);
+        assert!(!cfg.drag_set);
+        assert!(!cfg.random_interval);
+        assert_eq!(cfg.interval_max_ms, 0);
+        assert!(!cfg.ramp);
+        assert_eq!(cfg.ramp_to_ms, 0);
+        assert_eq!(cfg.ramp_seconds, 60);
+    }
+
+    #[test]
+    fn config_rejects_bad_slice2_fields() {
+        for bad in [
+            "{\"keybind_vk\": 117, \"scroll_amount\": 0}",
+            "{\"keybind_vk\": 117, \"scroll_amount\": 11}",
+            "{\"keybind_vk\": 117, \"scroll_amount\": -11}",
+            "{\"keybind_vk\": 117, \"repeat_vk\": 27}", // Esc
+            "{\"keybind_vk\": 117, \"repeat_vk\": 1}",  // mouse
+            "{\"keybind_vk\": 117, \"interval_max_ms\": 60001}",
+            "{\"keybind_vk\": 117, \"ramp_to_ms\": 60001}",
+            "{\"keybind_vk\": 117, \"ramp_seconds\": 0}",
+            "{\"keybind_vk\": 117, \"drag_ax\": \"left\"}",
+        ] {
+            assert_eq!(Config::from_json(bad), None, "{bad}");
+        }
+        // Negative coordinates and scroll are legitimate values.
+        assert!(Config::from_json(
+            "{\"keybind_vk\": 117, \"drag_ax\": -1920, \"scroll_amount\": -10}"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn action_names_include_slice2() {
+        for a in [ClickAction::Scroll, ClickAction::Key, ClickAction::Drag] {
+            assert_eq!(ClickAction::from_name(a.as_str()), Some(a));
+            assert!(!a.is_click_action());
+        }
+        for a in [ClickAction::Single, ClickAction::Double, ClickAction::Burst] {
+            assert!(a.is_click_action());
+        }
+    }
+
+    #[test]
+    fn ramp_interpolates_and_clamps() {
+        assert_eq!(ramped_interval_ms(100, 10, 0, 60), 100);
+        assert_eq!(ramped_interval_ms(100, 10, 30, 60), 55);
+        assert_eq!(ramped_interval_ms(100, 10, 60, 60), 10);
+        assert_eq!(ramped_interval_ms(100, 10, 600, 60), 10);
+        assert_eq!(ramped_interval_ms(100, 10, 0, 0), 10);
+        assert_eq!(ramped_interval_ms(10, 100, 30, 60), 55);
+        assert!(is_valid_ramp_seconds(1) && is_valid_ramp_seconds(MAX_RAMP_SECONDS));
+        assert!(!is_valid_ramp_seconds(0));
+    }
+
+    #[test]
+    fn extended_key_set() {
+        assert!(is_extended_key(0x25)); // Left arrow
+        assert!(is_extended_key(0x2E)); // Delete
+        assert!(is_extended_key(0x24)); // Home
+        assert!(is_extended_key(0x5B)); // Left Win
+        assert!(!is_extended_key(0x41)); // A
+        assert!(!is_extended_key(0x20)); // Space
+        assert!(!is_extended_key(0x70)); // F1
     }
 
     #[test]
