@@ -245,6 +245,142 @@ pub fn is_valid_limit(n: u32) -> bool {
     n <= MAX_LIMIT_CLICKS
 }
 
+/// Where cycles land: follow the cursor, one locked point, or a
+/// rotating sequence of points. (Slice 3 of the 50-enhancement
+/// program; replaces the pre-0.8 `lock_position` boolean, which the
+/// config parser still honours for older files.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TargetMode {
+    #[default]
+    Follow,
+    Locked,
+    Sequence,
+}
+
+impl TargetMode {
+    /// The config-file spelling of this target mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TargetMode::Follow => "follow",
+            TargetMode::Locked => "locked",
+            TargetMode::Sequence => "sequence",
+        }
+    }
+
+    /// Parse a config-file spelling; `None` for anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "follow" => Some(TargetMode::Follow),
+            "locked" => Some(TargetMode::Locked),
+            "sequence" => Some(TargetMode::Sequence),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name for menus and dialogs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            TargetMode::Follow => "Follow",
+            TargetMode::Locked => "Locked",
+            TargetMode::Sequence => "Sequence",
+        }
+    }
+}
+
+/// The most points a multi-point sequence may hold.
+pub const MAX_SEQ_POINTS: u32 = 4;
+
+/// The number of named target slots.
+pub const MAX_SLOTS: usize = 3;
+
+/// Click offsets (px from the cursor/lock point) must stay within
+/// ±200 on each axis.
+pub const MAX_OFFSET_PX: i32 = 200;
+
+pub fn is_valid_offset(v: i32) -> bool {
+    (-MAX_OFFSET_PX..=MAX_OFFSET_PX).contains(&v)
+}
+
+/// The pixel-check tolerance: the largest per-channel difference
+/// (0–255 scale) that still counts as "the same colour".
+pub const MAX_PIXEL_TOL: u32 = 64;
+pub const DEFAULT_PIXEL_TOL: u32 = 16;
+
+pub fn is_valid_pixel_tol(n: u32) -> bool {
+    n <= MAX_PIXEL_TOL
+}
+
+/// True when two packed `0xRRGGBB` colours are within `tol` on every
+/// channel — the pixel check's "same colour" test.
+pub fn colour_matches(sample: u32, target: u32, tol: u32) -> bool {
+    let chan = |c: u32, shift: u32| ((c >> shift) & 0xFF) as i32;
+    (chan(sample, 16) - chan(target, 16)).abs() <= tol as i32
+        && (chan(sample, 8) - chan(target, 8)).abs() <= tol as i32
+        && (chan(sample, 0) - chan(target, 0)).abs() <= tol as i32
+}
+
+/// How many samples of a region signature differ between two reads,
+/// comparing packed colours with a small fixed tolerance (lighting
+/// noise must not count as change). Slices of different lengths
+/// compare over their common prefix.
+pub fn region_diff_count(baseline: &[u32], current: &[u32]) -> usize {
+    baseline
+        .iter()
+        .zip(current.iter())
+        .filter(|(b, c)| !colour_matches(**b, **c, 8))
+        .count()
+}
+
+/// The region-change stop: the region counts as changed when more
+/// than a quarter of its samples differ from the run-start read.
+pub fn region_changed(baseline: &[u32], current: &[u32]) -> bool {
+    if baseline.is_empty() || baseline.len() != current.len() {
+        return false;
+    }
+    region_diff_count(baseline, current) * 4 > baseline.len()
+}
+
+/// The centre of the first monitor that does not contain `current`
+/// — the "other monitor" quick-lock preset. `monitors` are
+/// `(left, top, right, bottom)` rects in virtual-screen coordinates.
+/// `None` when there is no other monitor to jump to.
+pub fn other_monitor_centre(
+    monitors: &[(i32, i32, i32, i32)],
+    current: (i32, i32),
+) -> Option<(i32, i32)> {
+    if monitors.len() < 2 {
+        return None;
+    }
+    let contains = |m: &(i32, i32, i32, i32)| {
+        current.0 >= m.0 && current.0 < m.2 && current.1 >= m.1 && current.1 < m.3
+    };
+    let home = monitors.iter().position(contains).unwrap_or(0);
+    let other = monitors[(home + 1) % monitors.len()];
+    Some(((other.0 + other.2) / 2, (other.1 + other.3) / 2))
+}
+
+/// The longest slot name the config accepts.
+pub const MAX_SLOT_NAME: usize = 20;
+
+/// Reduce arbitrary text to a slot name: letters, digits, spaces and
+/// `-_'.,` survive, everything else is dropped, and the result is
+/// truncated to [`MAX_SLOT_NAME`] chars and trimmed. The restricted
+/// charset keeps names safe for the hand-rolled JSON writer (no
+/// quotes or backslashes can occur).
+pub fn sanitize_slot_name(raw: &str) -> String {
+    let kept: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || " -_'.,".contains(*c))
+        .take(MAX_SLOT_NAME)
+        .collect();
+    kept.trim().to_string()
+}
+
+/// True when `name` is a slot name the config accepts as-is.
+pub fn is_valid_slot_name(name: &str) -> bool {
+    name.chars().count() <= MAX_SLOT_NAME && sanitize_slot_name(name) == name
+}
+
 /// Map a point on an axis to the 0..=65535 absolute coordinate that
 /// `SendInput` expects for that axis of the virtual screen, given the
 /// axis `origin` (which may be negative) and `extent` in pixels.
@@ -516,7 +652,7 @@ pub fn key_name(vk: u32) -> String {
 /// or hold), whether clicks lock to the position where clicking
 /// started, the auto-stop limit in clicks (0 = no limit), and whether
 /// clicking starts when TrayClick launches (click mode only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub keybind_vk: u32,
     pub interval_ms: u32,
@@ -543,6 +679,42 @@ pub struct Config {
     pub ramp: bool,
     pub ramp_to_ms: u32,
     pub ramp_seconds: u32,
+    // Fields added in 0.8.0 (50-enhancement program, slice 3 —
+    // targeting). `lock_position` above is kept in sync with `target`
+    // (true unless Follow) so pre-0.8 builds can still read the file.
+    pub target: TargetMode,
+    /// The persistent lock point, picked with the crosshair overlay
+    /// (slice-2 runs captured one per activation; that fallback stays
+    /// for when no persistent point is set).
+    pub lock_x: i32,
+    pub lock_y: i32,
+    pub lock_set: bool,
+    /// Window-relative lock: the point follows the window it was
+    /// picked on, at this offset from the window's top-left corner.
+    /// (The window itself is matched live, never persisted.)
+    pub lock_rel: bool,
+    pub lock_rx: i32,
+    pub lock_ry: i32,
+    /// The multi-point sequence (first `seq_count` points are used).
+    pub seq_count: u32,
+    pub seq_x: [i32; 4],
+    pub seq_y: [i32; 4],
+    /// Three named target slots.
+    pub slot_x: [i32; 3],
+    pub slot_y: [i32; 3],
+    pub slot_set: [bool; 3],
+    pub slot_names: [String; 3],
+    /// Click offset from the cursor/lock point, in pixels.
+    pub offset_x: i32,
+    pub offset_y: i32,
+    /// The pixel check: only click while the pixel at the click
+    /// point matches `pixel_rgb` (packed 0xRRGGBB) within tolerance.
+    pub pixel_check: bool,
+    pub pixel_set: bool,
+    pub pixel_rgb: u32,
+    pub pixel_tol: u32,
+    /// Stop the run when the region around the click point changes.
+    pub region_guard: bool,
 }
 
 impl Default for Config {
@@ -573,6 +745,27 @@ impl Default for Config {
             ramp: false,
             ramp_to_ms: 0,
             ramp_seconds: 60,
+            target: TargetMode::Follow,
+            lock_x: 0,
+            lock_y: 0,
+            lock_set: false,
+            lock_rel: false,
+            lock_rx: 0,
+            lock_ry: 0,
+            seq_count: 0,
+            seq_x: [0; 4],
+            seq_y: [0; 4],
+            slot_x: [0; 3],
+            slot_y: [0; 3],
+            slot_set: [false; 3],
+            slot_names: [String::new(), String::new(), String::new()],
+            offset_x: 0,
+            offset_y: 0,
+            pixel_check: false,
+            pixel_set: false,
+            pixel_rgb: 0,
+            pixel_tol: DEFAULT_PIXEL_TOL,
+            region_guard: false,
         }
     }
 }
@@ -634,7 +827,7 @@ impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {}\n}}\n",
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {},\n  \"target\": \"{}\",\n  \"lock_x\": {},\n  \"lock_y\": {},\n  \"lock_set\": {},\n  \"lock_rel\": {},\n  \"lock_rx\": {},\n  \"lock_ry\": {},\n  \"seq_count\": {},\n  \"seq_x1\": {},\n  \"seq_y1\": {},\n  \"seq_x2\": {},\n  \"seq_y2\": {},\n  \"seq_x3\": {},\n  \"seq_y3\": {},\n  \"seq_x4\": {},\n  \"seq_y4\": {},\n  \"slot1_x\": {},\n  \"slot1_y\": {},\n  \"slot1_set\": {},\n  \"slot1_name\": \"{}\",\n  \"slot2_x\": {},\n  \"slot2_y\": {},\n  \"slot2_set\": {},\n  \"slot2_name\": \"{}\",\n  \"slot3_x\": {},\n  \"slot3_y\": {},\n  \"slot3_set\": {},\n  \"slot3_name\": \"{}\",\n  \"offset_x\": {},\n  \"offset_y\": {},\n  \"pixel_check\": {},\n  \"pixel_set\": {},\n  \"pixel_rgb\": {},\n  \"pixel_tol\": {},\n  \"region_guard\": {}\n}}\n",
             self.keybind_vk,
             self.interval_ms,
             self.button.as_str(),
@@ -659,7 +852,42 @@ impl Config {
             self.interval_max_ms,
             self.ramp,
             self.ramp_to_ms,
-            self.ramp_seconds
+            self.ramp_seconds,
+            self.target.as_str(),
+            self.lock_x,
+            self.lock_y,
+            self.lock_set,
+            self.lock_rel,
+            self.lock_rx,
+            self.lock_ry,
+            self.seq_count,
+            self.seq_x[0],
+            self.seq_y[0],
+            self.seq_x[1],
+            self.seq_y[1],
+            self.seq_x[2],
+            self.seq_y[2],
+            self.seq_x[3],
+            self.seq_y[3],
+            self.slot_x[0],
+            self.slot_y[0],
+            self.slot_set[0],
+            self.slot_names[0],
+            self.slot_x[1],
+            self.slot_y[1],
+            self.slot_set[1],
+            self.slot_names[1],
+            self.slot_x[2],
+            self.slot_y[2],
+            self.slot_set[2],
+            self.slot_names[2],
+            self.offset_x,
+            self.offset_y,
+            self.pixel_check,
+            self.pixel_set,
+            self.pixel_rgb,
+            self.pixel_tol,
+            self.region_guard
         )
     }
 
@@ -792,13 +1020,91 @@ impl Config {
             }
             None => 60,
         };
+        // Fields added in 0.8.0 (50-enhancement program, slice 3 —
+        // targeting); absent in older files, defaults apply. The
+        // `target` string wins; older files carry only the
+        // `lock_position` boolean (true → Locked, false → Follow).
+        let target = match json_str(text, "\"target\"") {
+            Some(name) => TargetMode::from_name(&name)?,
+            None => {
+                if lock_position {
+                    TargetMode::Locked
+                } else {
+                    TargetMode::Follow
+                }
+            }
+        };
+        let lock_x = opt_i32(text, "\"lock_x\"")?;
+        let lock_y = opt_i32(text, "\"lock_y\"")?;
+        let lock_set = opt_bool(text, "\"lock_set\"")?;
+        let lock_rel = opt_bool(text, "\"lock_rel\"")?;
+        let lock_rx = opt_i32(text, "\"lock_rx\"")?;
+        let lock_ry = opt_i32(text, "\"lock_ry\"")?;
+        let seq_count = match json_u32(text, "\"seq_count\"") {
+            Some(n) => {
+                if n > MAX_SEQ_POINTS {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let mut seq_x = [0; 4];
+        let mut seq_y = [0; 4];
+        for i in 0..4 {
+            seq_x[i] = opt_i32(text, &format!("\"seq_x{}\"", i + 1))?;
+            seq_y[i] = opt_i32(text, &format!("\"seq_y{}\"", i + 1))?;
+        }
+        let mut slot_x = [0; 3];
+        let mut slot_y = [0; 3];
+        let mut slot_set = [false; 3];
+        let mut slot_names: [String; 3] = [String::new(), String::new(), String::new()];
+        for i in 0..3 {
+            slot_x[i] = opt_i32(text, &format!("\"slot{}_x\"", i + 1))?;
+            slot_y[i] = opt_i32(text, &format!("\"slot{}_y\"", i + 1))?;
+            slot_set[i] = opt_bool(text, &format!("\"slot{}_set\"", i + 1))?;
+            slot_names[i] = match json_str(text, &format!("\"slot{}_name\"", i + 1)) {
+                Some(name) => {
+                    if !is_valid_slot_name(&name) {
+                        return None;
+                    }
+                    name
+                }
+                None => String::new(),
+            };
+        }
+        let offset_x = opt_i32(text, "\"offset_x\"")?;
+        let offset_y = opt_i32(text, "\"offset_y\"")?;
+        if !is_valid_offset(offset_x) || !is_valid_offset(offset_y) {
+            return None;
+        }
+        let pixel_check = opt_bool(text, "\"pixel_check\"")?;
+        let pixel_set = opt_bool(text, "\"pixel_set\"")?;
+        let pixel_rgb = match json_u32(text, "\"pixel_rgb\"") {
+            Some(n) => {
+                if n > 0x00FF_FFFF {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let pixel_tol = match json_u32(text, "\"pixel_tol\"") {
+            Some(n) => {
+                if !is_valid_pixel_tol(n) {
+                    return None;
+                }
+                n
+            }
+            None => DEFAULT_PIXEL_TOL,
+        };
+        let region_guard = opt_bool(text, "\"region_guard\"")?;
         Some(Self {
             keybind_vk: vk,
             interval_ms,
             button,
             jitter,
             mode,
-            lock_position,
             limit_clicks,
             start_on_launch,
             action,
@@ -818,6 +1124,28 @@ impl Config {
             ramp,
             ramp_to_ms,
             ramp_seconds,
+            lock_position: target != TargetMode::Follow,
+            target,
+            lock_x,
+            lock_y,
+            lock_set,
+            lock_rel,
+            lock_rx,
+            lock_ry,
+            seq_count,
+            seq_x,
+            seq_y,
+            slot_x,
+            slot_y,
+            slot_set,
+            slot_names,
+            offset_x,
+            offset_y,
+            pixel_check,
+            pixel_set,
+            pixel_rgb,
+            pixel_tol,
+            region_guard,
         })
     }
 }
@@ -958,9 +1286,137 @@ mod tests {
             ramp: true,
             ramp_to_ms: 20,
             ramp_seconds: 120,
+            target: TargetMode::Sequence,
+            lock_x: -500,
+            lock_y: 700,
+            lock_set: true,
+            lock_rel: true,
+            lock_rx: 40,
+            lock_ry: -15,
+            seq_count: 3,
+            seq_x: [10, -20, 30, 0],
+            seq_y: [100, 200, -300, 0],
+            slot_x: [1, 2, 3],
+            slot_y: [4, 5, 6],
+            slot_set: [true, false, true],
+            slot_names: [
+                "Boss button".to_string(),
+                String::new(),
+                "Craft, mk.2".to_string(),
+            ],
+            offset_x: -25,
+            offset_y: 40,
+            pixel_check: true,
+            pixel_set: true,
+            pixel_rgb: 0x00FF_8040,
+            pixel_tol: 24,
+            region_guard: true,
         };
         let json = cfg.to_json();
         assert_eq!(Config::from_json(&json), Some(cfg));
+    }
+
+    #[test]
+    fn config_from_070_gets_slice3_defaults() {
+        // A v0.7.0 config has lock_position but no target or slice-3
+        // fields: the boolean maps (true → Locked), all else defaults.
+        let cfg = Config::from_json("{\"keybind_vk\": 117, \"lock_position\": true}").unwrap();
+        assert_eq!(cfg.target, TargetMode::Locked);
+        assert!(cfg.lock_position);
+        assert!(!cfg.lock_set);
+        assert_eq!(cfg.seq_count, 0);
+        assert_eq!(cfg.offset_x, 0);
+        assert!(!cfg.pixel_check);
+        assert_eq!(cfg.pixel_tol, DEFAULT_PIXEL_TOL);
+        assert!(!cfg.region_guard);
+        let cfg = Config::from_json("{\"keybind_vk\": 117}").unwrap();
+        assert_eq!(cfg.target, TargetMode::Follow);
+        assert!(!cfg.lock_position);
+    }
+
+    #[test]
+    fn config_rejects_bad_slice3_fields() {
+        for bad in [
+            "{\"keybind_vk\": 117, \"target\": \"orbit\"}",
+            "{\"keybind_vk\": 117, \"seq_count\": 5}",
+            "{\"keybind_vk\": 117, \"offset_x\": 201}",
+            "{\"keybind_vk\": 117, \"offset_y\": -201}",
+            "{\"keybind_vk\": 117, \"pixel_rgb\": 16777216}",
+            "{\"keybind_vk\": 117, \"pixel_tol\": 65}",
+            "{\"keybind_vk\": 117, \"slot1_name\": \"has \\\"quote\\\"\"}",
+            "{\"keybind_vk\": 117, \"slot2_name\": \"this name is far too long\"}",
+            "{\"keybind_vk\": 117, \"seq_x2\": \"left\"}",
+        ] {
+            assert_eq!(Config::from_json(bad), None, "{bad}");
+        }
+        // Boundary values are legitimate.
+        assert!(Config::from_json(
+            "{\"keybind_vk\": 117, \"seq_count\": 4, \"offset_x\": -200, \"pixel_tol\": 64}"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn target_mode_names() {
+        for t in [TargetMode::Follow, TargetMode::Locked, TargetMode::Sequence] {
+            assert_eq!(TargetMode::from_name(t.as_str()), Some(t));
+        }
+        assert_eq!(TargetMode::from_name("lock"), None);
+    }
+
+    #[test]
+    fn colour_matching() {
+        assert!(colour_matches(0xFF8040, 0xFF8040, 0));
+        assert!(colour_matches(0xFF8040, 0xFE7F41, 1));
+        assert!(!colour_matches(0xFF8040, 0xFD8040, 1)); // red off by 2
+        assert!(colour_matches(0x000000, 0x404040, 64));
+        assert!(!colour_matches(0x000000, 0x410000, 64)); // one channel over
+    }
+
+    #[test]
+    fn region_change_detection() {
+        let base = [0x101010; 8];
+        assert!(!region_changed(&base, &base));
+        // One of eight samples fully different: 1*4 <= 8, not a change.
+        let mut slight = base;
+        slight[3] = 0xFFFFFF;
+        assert!(!region_changed(&base, &slight));
+        // Three of eight: 3*4 > 8, a change.
+        let mut moved = base;
+        moved[0] = 0xFFFFFF;
+        moved[1] = 0xFFFFFF;
+        moved[2] = 0xFFFFFF;
+        assert!(region_changed(&base, &moved));
+        // Lighting noise within the fixed tolerance is not a change.
+        let noisy = [0x141414; 8];
+        assert!(!region_changed(&base, &noisy));
+        assert_eq!(region_diff_count(&base, &moved), 3);
+    }
+
+    #[test]
+    fn other_monitor_centre_picks_the_other_one() {
+        let dual = [(0, 0, 1920, 1080), (1920, 0, 3840, 1080)];
+        assert_eq!(other_monitor_centre(&dual, (100, 100)), Some((2880, 540)));
+        assert_eq!(other_monitor_centre(&dual, (2000, 100)), Some((960, 540)));
+        // One monitor: nowhere to jump.
+        assert_eq!(other_monitor_centre(&dual[..1], (100, 100)), None);
+        // Point outside every monitor: the first counts as home.
+        assert_eq!(other_monitor_centre(&dual, (9999, 9999)), Some((2880, 540)));
+        // A monitor left of the primary (negative coordinates).
+        let neg = [(-1920, 0, 0, 1080), (0, 0, 1920, 1080)];
+        assert_eq!(other_monitor_centre(&neg, (100, 100)), Some((-960, 540)));
+    }
+
+    #[test]
+    fn slot_name_rules() {
+        assert_eq!(sanitize_slot_name("Boss button!"), "Boss button");
+        assert_eq!(sanitize_slot_name("  Craft, mk.2  "), "Craft, mk.2");
+        assert_eq!(sanitize_slot_name("a\"b\\c"), "abc");
+        assert!(is_valid_slot_name(""));
+        assert!(is_valid_slot_name("Boss button"));
+        assert!(!is_valid_slot_name("Boss button!"));
+        assert!(!is_valid_slot_name("trailing "));
+        assert!(!is_valid_slot_name("this name is far too long"));
     }
 
     #[test]
