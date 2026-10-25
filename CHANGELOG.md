@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 — 2026-10-25
+
+Slice 1 of the 50-enhancement program (docs/PROGRAM-50.md): the DPI fix plus the click-action foundation.
+
+- **Per-monitor DPI awareness (item 46).** TrayClick now declares PerMonitorV2 awareness at startup. On scaled displays (125%, 150%, …) Windows otherwise virtualizes coordinates, which could put locked-position clicks a few pixels off target; they now land exactly.
+- **Click actions (items 1, 5).** A new Action setting in the Set Interval window: **Single** (as always), **Double** (each cycle sends a double-click), or **Burst** (each cycle sends several clicks — 1 to 100, spaced by a configurable gap of 1–1000 ms). A burst stops early if you toggle clicking off, trip the corner failsafe, or hit the auto-stop limit; the limit counts physical clicks, so a burst of 5 counts 5.
+- **Button-down time (item 7).** "Down" in the numbers row: each click can hold its button down for 0–1000 ms before releasing (0 = instant, as before) — for games and apps that miss very short clicks.
+- **Alternating buttons (item 9).** Consecutive clicks alternate between button partners: Left ↔ Right, Middle pairs with Left.
+
+Config files from every earlier version load unchanged — action defaults to Single, burst to 3 clicks at a 50 ms gap, down time to 0, alternation off.
+
 ## 0.5.1 — 2026-10-24
 
 Internal review and optimization pass (the second senior review, after 0.2.2). No features added or removed, and no intended behaviour changes:
