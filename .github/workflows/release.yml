@@ -40,9 +40,24 @@ jobs:
           & $iscc "/DAppVersion=$ver" "/DTagName=$tag" installer/TrayClick.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist | Select-Object Name, Length
+      - name: Bundle release zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $setup = Get-ChildItem "dist/TrayClick-Setup-*.exe" | Select-Object -First 1
+          $port = Get-ChildItem "dist/TrayClick-*-portable.exe" | Select-Object -First 1
+          $sum = @()
+          foreach ($f in @($setup, $port)) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            $sum += "$h  $($f.Name)"
+          }
+          $sum | Out-File -Encoding ascii "dist/SHA256SUMS.txt"
+          Compress-Archive -Path $setup.FullName, $port.FullName, "dist/SHA256SUMS.txt" -DestinationPath "dist/TrayClick-$tag.zip"
+          Get-ChildItem dist | Select-Object Name, Length
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/TrayClick-*-portable.exe
             dist/TrayClick-Setup-*.exe
+            dist/TrayClick-*.zip
