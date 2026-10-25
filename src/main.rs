@@ -31,7 +31,11 @@
 //! the click action — single, double, or a burst of clicks — plus a
 //! per-click button-down duration and alternating buttons, and made
 //! the process per-monitor DPI aware so locked clicks land exactly
-//! on scaled displays.
+//! on scaled displays. The 0.7.0 slice added the Scroll, Key, and
+//! Drag actions (wheel ticks, a repeated keystroke, a two-point drag
+//! captured on a full-screen overlay), a random interval range, and
+//! a per-run speed ramp. Hold mode applies to the mouse-click
+//! actions only; Scroll/Key/Drag repeat on the interval either way.
 //!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
@@ -63,10 +67,11 @@ mod win {
 
     use trayclick::{
         absolute_coord, effective_button, format_count, ico_image_for_size, in_failsafe_corner,
-        is_valid_burst_clicks, is_valid_burst_gap, is_valid_interval, is_valid_keybind,
-        is_valid_limit, is_valid_press_ms, jittered_interval_ms, key_name, next_click_deadline,
-        ClickAction, ClickButton, ClickMode, Config, Engine, KeyPressDetector, MAX_INTERVAL_MS,
-        MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        is_extended_key, is_valid_burst_clicks, is_valid_burst_gap, is_valid_interval,
+        is_valid_keybind, is_valid_limit, is_valid_press_ms, is_valid_ramp_seconds,
+        is_valid_scroll_amount, jittered_interval_ms, key_name, next_click_deadline,
+        ramped_interval_ms, ClickAction, ClickButton, ClickMode, Config, Engine, KeyPressDetector,
+        MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR};
@@ -87,10 +92,11 @@ mod win {
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
-        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-        MOUSEINPUT, MOUSE_EVENT_FLAGS,
+        GetAsyncKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -141,6 +147,15 @@ mod win {
     const ID_IV_GAP_EDIT: usize = 2017;
     const ID_IV_PRESS_EDIT: usize = 2018;
     const ID_IV_NUM_SET: usize = 2019;
+    const ID_IV_REPEAT: usize = 2020;
+    const ID_IV_DRAG: usize = 2021;
+    const ID_IV_SCROLL_EDIT: usize = 2022;
+    const ID_IV_RANDOM: usize = 2023;
+    const ID_IV_MAX_EDIT: usize = 2024;
+    const ID_IV_RAMP: usize = 2025;
+    const ID_IV_RAMP_TO_EDIT: usize = 2026;
+    const ID_IV_RAMP_SECS_EDIT: usize = 2027;
+    const ID_IV_TIMING_SET: usize = 2028;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
@@ -176,6 +191,24 @@ mod win {
     static PRESS_MS: AtomicU32 = AtomicU32::new(0);
     /// Whether consecutive clicks alternate between button partners.
     static ALTERNATE: AtomicBool = AtomicBool::new(false);
+    /// Wheel notches per Scroll cycle (negative = down).
+    static SCROLL_AMT: AtomicI32 = AtomicI32::new(1);
+    /// The keystroke the Key action repeats.
+    static REPEAT_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_REPEAT_VK);
+    /// The Drag action's two points and whether they have been set.
+    static DRAG_AX: AtomicI32 = AtomicI32::new(0);
+    static DRAG_AY: AtomicI32 = AtomicI32::new(0);
+    static DRAG_BX: AtomicI32 = AtomicI32::new(0);
+    static DRAG_BY: AtomicI32 = AtomicI32::new(0);
+    static DRAG_SET: AtomicBool = AtomicBool::new(false);
+    /// Random-interval mode: each cycle picks within [interval, max].
+    static RANDOM_ON: AtomicBool = AtomicBool::new(false);
+    static INTERVAL_MAX_MS: AtomicU32 = AtomicU32::new(0);
+    /// Speed ramp: the interval eases from the base to `ramp_to_ms`
+    /// over `ramp_seconds` of each run.
+    static RAMP_ON: AtomicBool = AtomicBool::new(false);
+    static RAMP_TO_MS: AtomicU32 = AtomicU32::new(0);
+    static RAMP_SECONDS: AtomicU32 = AtomicU32::new(60);
     /// Whether the mouse button is currently held down (hold mode).
     /// Every stop path funnels through `refresh_indicator`, which calls
     /// `sync_hold_state` — so every stop path releases the button.
@@ -188,6 +221,9 @@ mod win {
     /// press detector, so the key still held from choosing it does not
     /// count as a press. Clicking starts only on the next fresh press.
     static RESYNC_DETECTOR: AtomicBool = AtomicBool::new(false);
+    /// What the capture window is assigning: 0 = the toggle keybind,
+    /// 1 = the Key action's repeat key.
+    static CAPTURE_FOR: AtomicU32 = AtomicU32::new(0);
     /// The registered `TaskbarCreated` message id (0 until `run` sets
     /// it). Explorer broadcasts it when the taskbar is (re)created; the
     /// tray icon must then be re-added or it stays gone after an
@@ -286,6 +322,9 @@ mod win {
             ClickAction::Single => 0,
             ClickAction::Double => 1,
             ClickAction::Burst => 2,
+            ClickAction::Scroll => 3,
+            ClickAction::Key => 4,
+            ClickAction::Drag => 5,
         }
     }
 
@@ -293,6 +332,9 @@ mod win {
         match ACTION.load(Ordering::SeqCst) {
             1 => ClickAction::Double,
             2 => ClickAction::Burst,
+            3 => ClickAction::Scroll,
+            4 => ClickAction::Key,
+            5 => ClickAction::Drag,
             _ => ClickAction::Single,
         }
     }
@@ -313,6 +355,18 @@ mod win {
             burst_gap_ms: BURST_GAP_MS.load(Ordering::SeqCst),
             press_ms: PRESS_MS.load(Ordering::SeqCst),
             alternate: ALTERNATE.load(Ordering::SeqCst),
+            scroll_amount: SCROLL_AMT.load(Ordering::SeqCst),
+            repeat_vk: REPEAT_VK.load(Ordering::SeqCst),
+            drag_ax: DRAG_AX.load(Ordering::SeqCst),
+            drag_ay: DRAG_AY.load(Ordering::SeqCst),
+            drag_bx: DRAG_BX.load(Ordering::SeqCst),
+            drag_by: DRAG_BY.load(Ordering::SeqCst),
+            drag_set: DRAG_SET.load(Ordering::SeqCst),
+            random_interval: RANDOM_ON.load(Ordering::SeqCst),
+            interval_max_ms: INTERVAL_MAX_MS.load(Ordering::SeqCst),
+            ramp: RAMP_ON.load(Ordering::SeqCst),
+            ramp_to_ms: RAMP_TO_MS.load(Ordering::SeqCst),
+            ramp_seconds: RAMP_SECONDS.load(Ordering::SeqCst),
         }
     }
 
@@ -432,16 +486,143 @@ mod win {
         }
     }
 
-    /// One activation cycle: the configured action (single, double, or
-    /// a burst of clicks spaced by the burst gap). Stops early if
-    /// clicking was switched off, the failsafe trips, or the run hits
-    /// its auto-stop limit — a long burst never outlives any of them.
-    /// The clicker's own limit check settles the stop afterwards.
+    /// An absolute mouse-move input to a screen point (virtual-desktop
+    /// coordinates), used by the Drag action.
+    fn abs_move_input(x: i32, y: i32) -> INPUT {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            mouse_input(
+                absolute_coord(x, vx, vw) as i32,
+                absolute_coord(y, vy, vh) as i32,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            )
+        }
+    }
+
+    fn count_action() {
+        CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One Scroll cycle: wheel ticks at the cursor — or, with a locked
+    /// target, a dart to the lock point, the ticks, and a dart back,
+    /// in one batch (the wheel goes to the window under the pointer).
+    fn scroll_once() {
+        let amt = SCROLL_AMT.load(Ordering::SeqCst);
+        let size = std::mem::size_of::<INPUT>() as i32;
+        unsafe {
+            let mut wheel = mouse_input(0, 0, MOUSEEVENTF_WHEEL);
+            wheel.Anonymous.mi.mouseData = (amt * 120) as u32; // WHEEL_DELTA per notch
+            if LOCK_POS.load(Ordering::SeqCst) && LOCK_SET.load(Ordering::SeqCst) {
+                let target =
+                    abs_move_input(LOCK_X.load(Ordering::SeqCst), LOCK_Y.load(Ordering::SeqCst));
+                let mut cur = POINT::default();
+                if GetCursorPos(&mut cur).is_ok() {
+                    let back = abs_move_input(cur.x, cur.y);
+                    SendInput(&[target, wheel, back], size);
+                } else {
+                    SendInput(&[target, wheel], size);
+                }
+            } else {
+                SendInput(&[wheel], size);
+            }
+        }
+        count_action();
+    }
+
+    fn key_input(vk: u32, up: bool) -> INPUT {
+        let mut flags = KEYBD_EVENT_FLAGS::default();
+        if is_extended_key(vk) {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk as u16),
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    /// One Key cycle: press and release the repeat key, honouring the
+    /// button-down duration as the key-down duration.
+    fn key_once() {
+        let vk = REPEAT_VK.load(Ordering::SeqCst);
+        let press = PRESS_MS.load(Ordering::SeqCst);
+        let size = std::mem::size_of::<INPUT>() as i32;
+        unsafe {
+            SendInput(&[key_input(vk, false)], size);
+        }
+        if press > 0 {
+            std::thread::sleep(Duration::from_millis(press as u64));
+        }
+        unsafe {
+            SendInput(&[key_input(vk, true)], size);
+        }
+        count_action();
+    }
+
+    /// One Drag cycle: press at point A, glide to point B over ~50 ms,
+    /// optionally pause (the button-down duration), release. Once the
+    /// button is down the drag always completes its release — stopping
+    /// mid-drag would leave the button held.
+    fn drag_once() {
+        let (down, up) = button_flags(current_button());
+        let ax = DRAG_AX.load(Ordering::SeqCst);
+        let ay = DRAG_AY.load(Ordering::SeqCst);
+        let bx = DRAG_BX.load(Ordering::SeqCst);
+        let by = DRAG_BY.load(Ordering::SeqCst);
+        let size = std::mem::size_of::<INPUT>() as i32;
+        unsafe {
+            SendInput(&[abs_move_input(ax, ay), mouse_input(0, 0, down)], size);
+            for i in 1..=8 {
+                let x = ax + (bx - ax) * i / 8;
+                let y = ay + (by - ay) * i / 8;
+                SendInput(&[abs_move_input(x, y)], size);
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            let press = PRESS_MS.load(Ordering::SeqCst);
+            if press > 0 {
+                std::thread::sleep(Duration::from_millis(press as u64));
+            }
+            SendInput(&[mouse_input(0, 0, up)], size);
+        }
+        count_action();
+    }
+
+    /// One activation cycle, dispatched on the configured action.
+    /// The click actions (single, double, burst of clicks spaced by
+    /// the burst gap) stop early if clicking was switched off, the
+    /// failsafe trips, or the run hits its auto-stop limit — a long
+    /// burst never outlives any of them. The clicker's own limit
+    /// check settles the stop afterwards.
     fn perform_cycle() {
+        match current_action() {
+            ClickAction::Scroll => return scroll_once(),
+            ClickAction::Key => return key_once(),
+            ClickAction::Drag => {
+                if DRAG_SET.load(Ordering::SeqCst) {
+                    drag_once();
+                }
+                return;
+            }
+            _ => {}
+        }
         let n = match current_action() {
             ClickAction::Single => 1,
             ClickAction::Double => 2,
-            ClickAction::Burst => BURST_CLICKS.load(Ordering::SeqCst),
+            _ => BURST_CLICKS.load(Ordering::SeqCst),
         };
         let gap = Duration::from_millis(BURST_GAP_MS.load(Ordering::SeqCst) as u64);
         for i in 0..n {
@@ -509,7 +690,11 @@ mod win {
     /// UI thread funnels through — so the keybind, Pause, the failsafe,
     /// the limit, opening a dialog, and Exit all release a held button.
     fn sync_hold_state() {
-        let want = lock_engine().is_clicking_now() && current_mode() == ClickMode::Hold;
+        // Hold mode applies to the mouse-click actions only; with a
+        // Scroll, Key, or Drag action the engine simply repeats cycles.
+        let want = lock_engine().is_clicking_now()
+            && current_mode() == ClickMode::Hold
+            && current_action().is_click_action();
         let held = HELD.load(Ordering::SeqCst);
         if want && !held {
             send_button(true);
@@ -535,14 +720,35 @@ mod win {
         }
     }
 
-    /// The interval for the next cycle: the configured value, varied by
-    /// up to ±10% when jitter is on.
-    fn effective_interval(rng: &mut XorShift) -> Duration {
+    /// The interval for the next cycle. The base value is reshaped by
+    /// at most one of the ramp (interval eases toward a target over
+    /// the run) or the random range (each cycle picks within
+    /// [base, max]); jitter, when on, then varies the result by up to
+    /// ±10% as always.
+    fn effective_interval(rng: &mut XorShift, run_start: Option<Instant>) -> Duration {
         let base = INTERVAL_MS.load(Ordering::SeqCst);
-        let ms = if JITTER_ON.load(Ordering::SeqCst) {
-            jittered_interval_ms(base, rng.next())
+        let ms = if RAMP_ON.load(Ordering::SeqCst) && RAMP_TO_MS.load(Ordering::SeqCst) != 0 {
+            let elapsed = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            ramped_interval_ms(
+                base,
+                RAMP_TO_MS.load(Ordering::SeqCst),
+                elapsed,
+                RAMP_SECONDS.load(Ordering::SeqCst) as u64,
+            )
+        } else if RANDOM_ON.load(Ordering::SeqCst) {
+            let max = INTERVAL_MAX_MS.load(Ordering::SeqCst).max(base);
+            if max > base {
+                base + rng.next() % (max - base + 1)
+            } else {
+                base
+            }
         } else {
             base
+        };
+        let ms = if JITTER_ON.load(Ordering::SeqCst) {
+            jittered_interval_ms(ms, rng.next())
+        } else {
+            ms
         };
         Duration::from_millis(ms as u64)
     }
@@ -630,19 +836,22 @@ mod win {
             | 1;
         let mut rng = XorShift(seed);
         let mut deadline: Option<Instant> = None;
+        let mut run_start: Option<Instant> = None;
         loop {
             if !lock_engine().is_clicking_now() {
                 deadline = None;
+                run_start = None;
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            if current_mode() == ClickMode::Hold {
+            if current_mode() == ClickMode::Hold && current_action().is_click_action() {
                 // Nothing to schedule — the button is simply down. Just
                 // keep watch for the failsafe.
                 if cursor_in_failsafe() {
                     trip_failsafe();
                 }
                 deadline = None;
+                run_start = None;
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -653,15 +862,18 @@ mod win {
             }
             match deadline {
                 None => {
+                    if run_start.is_none() {
+                        run_start = Some(Instant::now());
+                    }
                     perform_cycle();
-                    deadline = Some(Instant::now() + effective_interval(&mut rng));
+                    deadline = Some(Instant::now() + effective_interval(&mut rng, run_start));
                 }
                 Some(d) => {
                     if Instant::now() >= d {
                         perform_cycle();
                         deadline = Some(next_click_deadline(
                             d,
-                            effective_interval(&mut rng),
+                            effective_interval(&mut rng, run_start),
                             Instant::now(),
                         ));
                     } else {
@@ -977,6 +1189,12 @@ mod win {
         let mode = current_mode().label();
         let action = match current_action() {
             ClickAction::Burst => format!("Burst ×{}", BURST_CLICKS.load(Ordering::SeqCst)),
+            ClickAction::Scroll => {
+                format!("Scroll ({:+} notches)", SCROLL_AMT.load(Ordering::SeqCst))
+            }
+            ClickAction::Key => {
+                format!("Key [{}]", key_name(REPEAT_VK.load(Ordering::SeqCst)))
+            }
             a => a.label().to_string(),
         };
         let target = if LOCK_POS.load(Ordering::SeqCst) {
@@ -1039,7 +1257,11 @@ mod win {
                 if vk == VK_ESCAPE_CODE {
                     let _ = DestroyWindow(hwnd);
                 } else if is_valid_keybind(vk) {
-                    KEYBIND_VK.store(vk, Ordering::SeqCst);
+                    if CAPTURE_FOR.load(Ordering::SeqCst) == 1 {
+                        REPEAT_VK.store(vk, Ordering::SeqCst);
+                    } else {
+                        KEYBIND_VK.store(vk, Ordering::SeqCst);
+                    }
                     save_config(current_config());
                     let _ = DestroyWindow(hwnd);
                 }
@@ -1067,9 +1289,18 @@ mod win {
     }
 
     fn open_capture_window(parent: HWND) {
+        open_capture(parent, false);
+    }
+
+    /// Open the key capture window. With `for_repeat` it assigns the
+    /// Key action's repeat key instead of the toggle keybind; the
+    /// capture mechanics (and the resync-on-close that keeps the
+    /// assigning press from counting as a use) are identical.
+    fn open_capture(parent: HWND, for_repeat: bool) {
         if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
             return; // already open
         }
+        CAPTURE_FOR.store(if for_repeat { 1 } else { 0 }, Ordering::SeqCst);
         // Stop any clicking in progress so stray clicks can't hit the dialog.
         lock_engine().clicking = false;
         refresh_indicator(parent);
@@ -1092,10 +1323,15 @@ mod win {
             let height = 150;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+            let title = wide(if for_repeat {
+                "TrayClick — Set Repeat Key"
+            } else {
+                "TrayClick — Set Keybind"
+            });
             let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("TrayClickCapture"),
-                w!("TrayClick — Set Keybind"),
+                PCWSTR(title.as_ptr()),
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                 x,
                 y,
@@ -1112,9 +1348,18 @@ mod win {
                     return;
                 }
             };
-            let current = key_name(KEYBIND_VK.load(Ordering::SeqCst));
+            let current = key_name(if for_repeat {
+                REPEAT_VK.load(Ordering::SeqCst)
+            } else {
+                KEYBIND_VK.load(Ordering::SeqCst)
+            });
+            let what = if for_repeat {
+                "the key repeated by the Key action"
+            } else {
+                "the toggle keybind"
+            };
             let label = wide(&format!(
-                "Press a key to set the toggle keybind.\r\n\r\nCurrent: {current}\r\nEsc to cancel."
+                "Press a key to set {what}.\r\n\r\nCurrent: {current}\r\nEsc to cancel."
             ));
             let _ = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -1131,6 +1376,142 @@ mod win {
                 Some(instance.into()),
                 None,
             );
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    // ---------- Drag-point capture overlay ----------
+
+    /// Which drag point the overlay is waiting for (0 = A, 1 = B), and
+    /// its instruction label (so the text can change after point A).
+    static DRAG_STEP: AtomicU32 = AtomicU32::new(0);
+    static DRAG_LABEL: AtomicI32 = AtomicI32::new(0);
+
+    unsafe extern "system" fn drag_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_LBUTTONDOWN => {
+                unsafe {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        if DRAG_STEP.load(Ordering::SeqCst) == 0 {
+                            DRAG_AX.store(pt.x, Ordering::SeqCst);
+                            DRAG_AY.store(pt.y, Ordering::SeqCst);
+                            DRAG_STEP.store(1, Ordering::SeqCst);
+                            let label_raw = DRAG_LABEL.load(Ordering::SeqCst);
+                            if label_raw != 0 {
+                                let label = HWND(label_raw as isize as *mut c_void);
+                                let t = wide(
+                                    "Point A set. Now click point B — where the drag ends. Esc cancels.",
+                                );
+                                let _ = SetWindowTextW(label, PCWSTR(t.as_ptr()));
+                            }
+                        } else {
+                            DRAG_BX.store(pt.x, Ordering::SeqCst);
+                            DRAG_BY.store(pt.y, Ordering::SeqCst);
+                            DRAG_SET.store(true, Ordering::SeqCst);
+                            save_config(current_config());
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN => {
+                if wparam.0 as u32 == VK_ESCAPE_CODE {
+                    let _ = DestroyWindow(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC => {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+                SetTextColor(hdc, COLORREF(0x00F2F2F2));
+                SetBkMode(hdc, TRANSPARENT);
+                LRESULT(dialog_bg_brush().0 as isize)
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                DIALOG_OPEN.store(false, Ordering::SeqCst);
+                RESYNC_DETECTOR.store(true, Ordering::SeqCst);
+                DRAG_LABEL.store(0, Ordering::SeqCst);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Cover the virtual screen with a dark overlay and record the
+    /// user's next two clicks as the Drag action's points A and B.
+    /// Opened from the settings window (which closes first, so no
+    /// dialog is up); Esc cancels without changing the points.
+    fn open_drag_overlay(parent: HWND) {
+        if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+            return; // a dialog is already open
+        }
+        DRAG_STEP.store(0, Ordering::SeqCst);
+        unsafe {
+            let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+            static REGISTERED: AtomicBool = AtomicBool::new(false);
+            if !REGISTERED.swap(true, Ordering::SeqCst) {
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(drag_wndproc),
+                    hInstance: instance.into(),
+                    hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
+                    hbrBackground: CreateSolidBrush(COLORREF(0x00181818)),
+                    lpszClassName: w!("TrayClickDragPick"),
+                    ..Default::default()
+                };
+                RegisterClassW(&wc);
+            }
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let hwnd = match CreateWindowExW(
+                WINDOW_EX_STYLE(0x0000_0008), // WS_EX_TOPMOST
+                w!("TrayClickDragPick"),
+                w!("TrayClick — Set Drag Points"),
+                WS_POPUP | WS_VISIBLE,
+                vx,
+                vy,
+                vw,
+                vh,
+                Some(parent),
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    DIALOG_OPEN.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            let label = wide("Click point A — where the drag starts. Esc cancels.");
+            if let Ok(lh) = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR(label.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                32,
+                32,
+                900,
+                30,
+                Some(hwnd),
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                DRAG_LABEL.store(lh.0 as i32, Ordering::SeqCst);
+            }
             let _ = SetFocus(Some(hwnd));
         }
     }
@@ -1198,6 +1579,22 @@ mod win {
                     ID_IV_ACTION => apply_action(hwnd),
                     ID_IV_ALT => apply_alt(hwnd),
                     ID_IV_NUM_SET => apply_numbers(hwnd),
+                    ID_IV_RANDOM => apply_random(hwnd),
+                    ID_IV_RAMP => apply_ramp(hwnd),
+                    ID_IV_TIMING_SET => apply_timing(hwnd),
+                    ID_IV_REPEAT => {
+                        // Capture windows open with no dialog up, so
+                        // close this window first, then open the
+                        // repeat-key capture from the main window.
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        let _ = DestroyWindow(hwnd);
+                        open_capture(parent, true);
+                    }
+                    ID_IV_DRAG => {
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        let _ = DestroyWindow(hwnd);
+                        open_drag_overlay(parent);
+                    }
                     // IDCANCEL (2) arrives when Esc is pressed via the
                     // dialog message loop.
                     2 => {
@@ -1276,6 +1673,34 @@ mod win {
         }
     }
 
+    fn repeat_caption() -> String {
+        format!("Repeat key: {}", key_name(REPEAT_VK.load(Ordering::SeqCst)))
+    }
+
+    fn drag_caption() -> &'static str {
+        if DRAG_SET.load(Ordering::SeqCst) {
+            "Drag points set ✓"
+        } else {
+            "Set drag points"
+        }
+    }
+
+    fn random_caption() -> &'static str {
+        if RANDOM_ON.load(Ordering::SeqCst) {
+            "Random: On"
+        } else {
+            "Random: Off"
+        }
+    }
+
+    fn ramp_caption() -> &'static str {
+        if RAMP_ON.load(Ordering::SeqCst) {
+            "Ramp: On"
+        } else {
+            "Ramp: Off"
+        }
+    }
+
     /// Repaint the button-row and jitter captions after a change.
     fn relabel_interval_controls(hwnd: HWND) {
         unsafe {
@@ -1312,6 +1737,22 @@ mod win {
             if let Ok(tb) = GetDlgItem(Some(hwnd), ID_IV_ALT as i32) {
                 let t = wide(alt_caption());
                 let _ = SetWindowTextW(tb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(rb) = GetDlgItem(Some(hwnd), ID_IV_REPEAT as i32) {
+                let t = wide(&repeat_caption());
+                let _ = SetWindowTextW(rb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(db) = GetDlgItem(Some(hwnd), ID_IV_DRAG as i32) {
+                let t = wide(drag_caption());
+                let _ = SetWindowTextW(db, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(rb) = GetDlgItem(Some(hwnd), ID_IV_RANDOM as i32) {
+                let t = wide(random_caption());
+                let _ = SetWindowTextW(rb, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(rb) = GetDlgItem(Some(hwnd), ID_IV_RAMP as i32) {
+                let t = wide(ramp_caption());
+                let _ = SetWindowTextW(rb, PCWSTR(t.as_ptr()));
             }
         }
     }
@@ -1374,7 +1815,10 @@ mod win {
         let next = match current_action() {
             ClickAction::Single => ClickAction::Double,
             ClickAction::Double => ClickAction::Burst,
-            ClickAction::Burst => ClickAction::Single,
+            ClickAction::Burst => ClickAction::Scroll,
+            ClickAction::Scroll => ClickAction::Key,
+            ClickAction::Key => ClickAction::Drag,
+            ClickAction::Drag => ClickAction::Single,
         };
         ACTION.store(action_u32(next), Ordering::SeqCst);
         save_config(current_config());
@@ -1408,27 +1852,98 @@ mod win {
             .ok()
     }
 
-    /// Apply the three numeric action fields (burst clicks, burst gap,
-    /// button-down time) at once; all three must be valid, or nothing
-    /// changes and a warning explains the ranges.
+    /// Read one signed numeric edit control (for the scroll amount,
+    /// which may be negative).
+    fn read_edit_i32(hwnd: HWND, id: usize) -> Option<i32> {
+        let edit = unsafe { GetDlgItem(Some(hwnd), id as i32) }.ok()?;
+        let mut buf = [0u16; 16];
+        let n = unsafe { GetWindowTextW(edit, &mut buf) };
+        if n <= 0 {
+            return None;
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+            .trim()
+            .parse::<i32>()
+            .ok()
+    }
+
+    /// Apply the four numeric action fields (burst clicks, burst gap,
+    /// button-down time, scroll notches) at once; all must be valid,
+    /// or nothing changes and a warning explains the ranges.
     fn apply_numbers(hwnd: HWND) {
         let burst = read_edit_u32(hwnd, ID_IV_BURST_EDIT);
         let gap = read_edit_u32(hwnd, ID_IV_GAP_EDIT);
         let press = read_edit_u32(hwnd, ID_IV_PRESS_EDIT);
+        let scroll = read_edit_i32(hwnd, ID_IV_SCROLL_EDIT);
         let valid = matches!(burst, Some(n) if is_valid_burst_clicks(n))
             && matches!(gap, Some(n) if is_valid_burst_gap(n))
-            && matches!(press, Some(n) if is_valid_press_ms(n));
+            && matches!(press, Some(n) if is_valid_press_ms(n))
+            && matches!(scroll, Some(n) if is_valid_scroll_amount(n));
         if valid {
             BURST_CLICKS.store(burst.unwrap_or_default(), Ordering::SeqCst);
             BURST_GAP_MS.store(gap.unwrap_or_default(), Ordering::SeqCst);
             PRESS_MS.store(press.unwrap_or_default(), Ordering::SeqCst);
+            SCROLL_AMT.store(scroll.unwrap_or_default(), Ordering::SeqCst);
             save_config(current_config());
             unsafe {
                 let _ = SetFocus(Some(hwnd));
             }
         } else {
             let text = wide(
-                "Burst: 1 to 100 clicks. Gap: 1 to 1000 ms. Down: 0 to 1000 ms (0 = instant).",
+                "Burst: 1 to 100 clicks. Gap: 1 to 1000 ms. Down: 0 to 1000 ms (0 = instant). Scroll: -10 to 10 notches, not 0.",
+            );
+            let title = wide("TrayClick — Set Interval");
+            unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+        }
+    }
+
+    fn apply_random(hwnd: HWND) {
+        let on = !RANDOM_ON.load(Ordering::SeqCst);
+        RANDOM_ON.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    fn apply_ramp(hwnd: HWND) {
+        let on = !RAMP_ON.load(Ordering::SeqCst);
+        RAMP_ON.store(on, Ordering::SeqCst);
+        save_config(current_config());
+        relabel_interval_controls(hwnd);
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+
+    /// Apply the timing fields (random-range max, ramp target, ramp
+    /// duration) at once; all must be valid, or nothing changes.
+    fn apply_timing(hwnd: HWND) {
+        let max = read_edit_u32(hwnd, ID_IV_MAX_EDIT);
+        let to = read_edit_u32(hwnd, ID_IV_RAMP_TO_EDIT);
+        let secs = read_edit_u32(hwnd, ID_IV_RAMP_SECS_EDIT);
+        let valid = matches!(max, Some(n) if n == 0 || is_valid_interval(n))
+            && matches!(to, Some(n) if n == 0 || is_valid_interval(n))
+            && matches!(secs, Some(n) if is_valid_ramp_seconds(n));
+        if valid {
+            INTERVAL_MAX_MS.store(max.unwrap_or_default(), Ordering::SeqCst);
+            RAMP_TO_MS.store(to.unwrap_or_default(), Ordering::SeqCst);
+            RAMP_SECONDS.store(secs.unwrap_or_default(), Ordering::SeqCst);
+            save_config(current_config());
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+        } else {
+            let text = wide(
+                "Max and Ramp-to: 0 (unset) or 1 to 60000 ms. Ramp duration: 1 to 86400 seconds.",
             );
             let title = wide("TrayClick — Set Interval");
             unsafe {
@@ -1502,7 +2017,7 @@ mod win {
                 RegisterClassW(&wc);
             }
             let width = 396;
-            let height = 488;
+            let height = 634;
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
             let hwnd = match CreateWindowExW(
@@ -1758,68 +2273,173 @@ mod win {
                 30,
                 ID_IV_ALT,
             );
+            let rep_cap = repeat_caption();
+            let _ = child(
+                w!("BUTTON"),
+                &rep_cap,
+                btn_style,
+                16,
+                362,
+                170,
+                30,
+                ID_IV_REPEAT,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                drag_caption(),
+                btn_style,
+                196,
+                362,
+                168,
+                30,
+                ID_IV_DRAG,
+            );
             let _ = child(
                 w!("STATIC"),
-                "Burst count, gap and button-down time:",
+                "Burst count / gap / down (ms) / scroll notches:",
                 label_style,
                 16,
-                366,
+                404,
                 360,
                 20,
                 0,
             );
-            let _ = child(w!("STATIC"), "Burst:", label_style, 16, 396, 40, 20, 0);
             let burst_now = BURST_CLICKS.load(Ordering::SeqCst).to_string();
             let _ = child(
                 w!("EDIT"),
                 &burst_now,
                 edit_style,
-                58,
-                390,
-                40,
+                16,
+                428,
+                52,
                 30,
                 ID_IV_BURST_EDIT,
             );
-            let _ = child(w!("STATIC"), "Gap:", label_style, 106, 396, 32, 20, 0);
             let gap_now = BURST_GAP_MS.load(Ordering::SeqCst).to_string();
             let _ = child(
                 w!("EDIT"),
                 &gap_now,
                 edit_style,
-                140,
-                390,
-                48,
+                76,
+                428,
+                52,
                 30,
                 ID_IV_GAP_EDIT,
             );
-            let _ = child(w!("STATIC"), "Down:", label_style, 196, 396, 40, 20, 0);
             let press_now = PRESS_MS.load(Ordering::SeqCst).to_string();
             let _ = child(
                 w!("EDIT"),
                 &press_now,
                 edit_style,
-                238,
-                390,
-                48,
+                136,
+                428,
+                52,
                 30,
                 ID_IV_PRESS_EDIT,
+            );
+            let scroll_now = SCROLL_AMT.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &scroll_now,
+                edit_style,
+                196,
+                428,
+                52,
+                30,
+                ID_IV_SCROLL_EDIT,
             );
             let _ = child(
                 w!("BUTTON"),
                 "Set",
                 btn_style,
-                294,
-                390,
-                70,
+                256,
+                428,
+                108,
                 30,
                 ID_IV_NUM_SET,
+            );
+            let _ = child(
+                w!("STATIC"),
+                "Random interval and speed ramp:",
+                label_style,
+                16,
+                470,
+                360,
+                20,
+                0,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                random_caption(),
+                btn_style,
+                16,
+                494,
+                120,
+                30,
+                ID_IV_RANDOM,
+            );
+            let _ = child(w!("STATIC"), "Max ms:", label_style, 144, 500, 52, 20, 0);
+            let max_now = INTERVAL_MAX_MS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &max_now,
+                edit_style,
+                200,
+                494,
+                56,
+                30,
+                ID_IV_MAX_EDIT,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                ramp_caption(),
+                btn_style,
+                264,
+                494,
+                100,
+                30,
+                ID_IV_RAMP,
+            );
+            let _ = child(w!("STATIC"), "Ramp to ms:", label_style, 16, 538, 68, 20, 0);
+            let to_now = RAMP_TO_MS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &to_now,
+                edit_style,
+                88,
+                532,
+                56,
+                30,
+                ID_IV_RAMP_TO_EDIT,
+            );
+            let _ = child(w!("STATIC"), "over secs:", label_style, 152, 538, 60, 20, 0);
+            let secs_now = RAMP_SECONDS.load(Ordering::SeqCst).to_string();
+            let _ = child(
+                w!("EDIT"),
+                &secs_now,
+                edit_style,
+                216,
+                532,
+                52,
+                30,
+                ID_IV_RAMP_SECS_EDIT,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                "Set",
+                btn_style,
+                276,
+                532,
+                88,
+                30,
+                ID_IV_TIMING_SET,
             );
             let _ = child(
                 w!("STATIC"),
                 "Presets apply at once. Custom interval: type a value and click Apply (range 1–60000). Numbers apply with their Set buttons. Esc cancels.",
                 label_style,
                 16,
-                428,
+                574,
                 360,
                 36,
                 0,
@@ -1969,6 +2589,18 @@ mod win {
         BURST_GAP_MS.store(cfg.burst_gap_ms, Ordering::SeqCst);
         PRESS_MS.store(cfg.press_ms, Ordering::SeqCst);
         ALTERNATE.store(cfg.alternate, Ordering::SeqCst);
+        SCROLL_AMT.store(cfg.scroll_amount, Ordering::SeqCst);
+        REPEAT_VK.store(cfg.repeat_vk, Ordering::SeqCst);
+        DRAG_AX.store(cfg.drag_ax, Ordering::SeqCst);
+        DRAG_AY.store(cfg.drag_ay, Ordering::SeqCst);
+        DRAG_BX.store(cfg.drag_bx, Ordering::SeqCst);
+        DRAG_BY.store(cfg.drag_by, Ordering::SeqCst);
+        DRAG_SET.store(cfg.drag_set, Ordering::SeqCst);
+        RANDOM_ON.store(cfg.random_interval, Ordering::SeqCst);
+        INTERVAL_MAX_MS.store(cfg.interval_max_ms, Ordering::SeqCst);
+        RAMP_ON.store(cfg.ramp, Ordering::SeqCst);
+        RAMP_TO_MS.store(cfg.ramp_to_ms, Ordering::SeqCst);
+        RAMP_SECONDS.store(cfg.ramp_seconds, Ordering::SeqCst);
         if cfg.start_on_launch && cfg.mode == ClickMode::Click {
             lock_engine().clicking = true;
             if cfg.lock_position {
