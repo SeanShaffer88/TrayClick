@@ -1,6 +1,6 @@
 [package]
 name = "trayclick"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "A tiny Windows tray auto clicker: one keybind toggles clicking — or holding — any mouse button at the cursor or a locked spot, at a set interval with optional jitter and an auto-stop limit."
 license = "MIT"
