@@ -95,6 +95,85 @@ impl ClickMode {
     }
 }
 
+/// What one activation cycle sends (in Click mode): a single click, a
+/// double-click, or a burst of several clicks spaced by a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClickAction {
+    #[default]
+    Single,
+    Double,
+    Burst,
+}
+
+impl ClickAction {
+    /// The config-file spelling of this action.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClickAction::Single => "single",
+            ClickAction::Double => "double",
+            ClickAction::Burst => "burst",
+        }
+    }
+
+    /// Parse a config-file spelling; `None` for anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "single" => Some(ClickAction::Single),
+            "double" => Some(ClickAction::Double),
+            "burst" => Some(ClickAction::Burst),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name for menus and dialogs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClickAction::Single => "Single",
+            ClickAction::Double => "Double",
+            ClickAction::Burst => "Burst",
+        }
+    }
+}
+
+/// Clicks per burst when the config does not say (and the burst default).
+pub const DEFAULT_BURST_CLICKS: u32 = 3;
+/// The most clicks one burst may contain.
+pub const MAX_BURST_CLICKS: u32 = 100;
+
+pub fn is_valid_burst_clicks(n: u32) -> bool {
+    (1..=MAX_BURST_CLICKS).contains(&n)
+}
+
+/// Gap between the clicks of a burst (and of a double-click), default.
+pub const DEFAULT_BURST_GAP_MS: u32 = 50;
+/// The largest burst gap the config accepts.
+pub const MAX_BURST_GAP_MS: u32 = 1_000;
+
+pub fn is_valid_burst_gap(ms: u32) -> bool {
+    (1..=MAX_BURST_GAP_MS).contains(&ms)
+}
+
+/// The longest a single click may hold its button down (0 = instant).
+pub const MAX_PRESS_MS: u32 = 1_000;
+
+pub fn is_valid_press_ms(ms: u32) -> bool {
+    ms <= MAX_PRESS_MS
+}
+
+/// The button a click in a run uses. With alternation on, odd-numbered
+/// clicks in the run use the base button's partner: Left ↔ Right, and
+/// Middle pairs with Left.
+pub fn effective_button(base: ClickButton, alternate: bool, run_clicks: u64) -> ClickButton {
+    if !alternate || run_clicks.is_multiple_of(2) {
+        return base;
+    }
+    match base {
+        ClickButton::Left => ClickButton::Right,
+        ClickButton::Right => ClickButton::Left,
+        ClickButton::Middle => ClickButton::Left,
+    }
+}
+
 /// The largest auto-stop limit (in clicks) the config accepts.
 pub const MAX_LIMIT_CLICKS: u32 = 100_000_000;
 
@@ -384,6 +463,11 @@ pub struct Config {
     pub lock_position: bool,
     pub limit_clicks: u32,
     pub start_on_launch: bool,
+    pub action: ClickAction,
+    pub burst_clicks: u32,
+    pub burst_gap_ms: u32,
+    pub press_ms: u32,
+    pub alternate: bool,
 }
 
 impl Default for Config {
@@ -397,6 +481,11 @@ impl Default for Config {
             lock_position: false,
             limit_clicks: 0,
             start_on_launch: false,
+            action: ClickAction::Single,
+            burst_clicks: DEFAULT_BURST_CLICKS,
+            burst_gap_ms: DEFAULT_BURST_GAP_MS,
+            press_ms: 0,
+            alternate: false,
         }
     }
 }
@@ -441,7 +530,7 @@ impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {}\n}}\n",
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {}\n}}\n",
             self.keybind_vk,
             self.interval_ms,
             self.button.as_str(),
@@ -449,7 +538,12 @@ impl Config {
             self.mode.as_str(),
             self.lock_position,
             self.limit_clicks,
-            self.start_on_launch
+            self.start_on_launch,
+            self.action.as_str(),
+            self.burst_clicks,
+            self.burst_gap_ms,
+            self.press_ms,
+            self.alternate
         )
     }
 
@@ -494,6 +588,40 @@ impl Config {
             None => 0,
         };
         let start_on_launch = opt_bool(text, "\"start_on_launch\"")?;
+        // Fields added in 0.6.0 (50-enhancement program, slice 1);
+        // absent in older files, defaults apply.
+        let action = match json_str(text, "\"action\"") {
+            Some(name) => ClickAction::from_name(&name)?,
+            None => ClickAction::Single,
+        };
+        let burst_clicks = match json_u32(text, "\"burst_clicks\"") {
+            Some(n) => {
+                if !is_valid_burst_clicks(n) {
+                    return None;
+                }
+                n
+            }
+            None => DEFAULT_BURST_CLICKS,
+        };
+        let burst_gap_ms = match json_u32(text, "\"burst_gap_ms\"") {
+            Some(n) => {
+                if !is_valid_burst_gap(n) {
+                    return None;
+                }
+                n
+            }
+            None => DEFAULT_BURST_GAP_MS,
+        };
+        let press_ms = match json_u32(text, "\"press_ms\"") {
+            Some(n) => {
+                if !is_valid_press_ms(n) {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        let alternate = opt_bool(text, "\"alternate\"")?;
         Some(Self {
             keybind_vk: vk,
             interval_ms,
@@ -503,6 +631,11 @@ impl Config {
             lock_position,
             limit_clicks,
             start_on_launch,
+            action,
+            burst_clicks,
+            burst_gap_ms,
+            press_ms,
+            alternate,
         })
     }
 }
@@ -611,9 +744,95 @@ mod tests {
             lock_position: true,
             limit_clicks: 5_000,
             start_on_launch: true,
+            action: ClickAction::Burst,
+            burst_clicks: 5,
+            burst_gap_ms: 80,
+            press_ms: 25,
+            alternate: true,
         };
         let json = cfg.to_json();
         assert_eq!(Config::from_json(&json), Some(cfg));
+    }
+
+    #[test]
+    fn config_from_051_gets_action_defaults() {
+        // A v0.5.1 config file has none of the slice-1 fields.
+        let cfg = Config::from_json(
+            "{\"keybind_vk\": 117, \"interval_ms\": 50, \"mode\": \"hold\", \"limit_clicks\": 10}",
+        )
+        .unwrap();
+        assert_eq!(cfg.action, ClickAction::Single);
+        assert_eq!(cfg.burst_clicks, DEFAULT_BURST_CLICKS);
+        assert_eq!(cfg.burst_gap_ms, DEFAULT_BURST_GAP_MS);
+        assert_eq!(cfg.press_ms, 0);
+        assert!(!cfg.alternate);
+    }
+
+    #[test]
+    fn config_rejects_bad_action_fields() {
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"action\": \"triple\"}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"burst_clicks\": 0}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"burst_clicks\": 101}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"burst_gap_ms\": 0}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"press_ms\": 1001}"),
+            None
+        );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"alternate\": \"yes\"}"),
+            None
+        );
+        assert!(is_valid_burst_clicks(1) && is_valid_burst_clicks(MAX_BURST_CLICKS));
+        assert!(is_valid_press_ms(0) && is_valid_press_ms(MAX_PRESS_MS));
+    }
+
+    #[test]
+    fn action_names_round_trip() {
+        for a in [ClickAction::Single, ClickAction::Double, ClickAction::Burst] {
+            assert_eq!(ClickAction::from_name(a.as_str()), Some(a));
+        }
+        assert_eq!(ClickAction::from_name("Single"), None);
+        assert_eq!(ClickAction::default(), ClickAction::Single);
+    }
+
+    #[test]
+    fn alternation_flips_partner_on_odd_clicks() {
+        assert_eq!(
+            effective_button(ClickButton::Left, false, 1),
+            ClickButton::Left
+        );
+        assert_eq!(
+            effective_button(ClickButton::Left, true, 0),
+            ClickButton::Left
+        );
+        assert_eq!(
+            effective_button(ClickButton::Left, true, 1),
+            ClickButton::Right
+        );
+        assert_eq!(
+            effective_button(ClickButton::Right, true, 3),
+            ClickButton::Left
+        );
+        assert_eq!(
+            effective_button(ClickButton::Middle, true, 1),
+            ClickButton::Left
+        );
+        assert_eq!(
+            effective_button(ClickButton::Middle, true, 2),
+            ClickButton::Middle
+        );
     }
 
     #[test]
