@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0 — 2026-10-25
+
+Slice 2 of the 50-enhancement program (docs/PROGRAM-50.md): three more actions, plus interval shaping.
+
+- **Scroll action (item 2).** The Action cycle now continues past Burst to **Scroll**: each cycle sends mouse-wheel ticks (−10 to +10 notches; negative scrolls down) at the cursor — or, with a locked target, darts to the lock point, scrolls there, and darts back.
+- **Key action (item 3).** **Key** repeats a keystroke instead of clicking. The "Repeat key" button in the settings window opens the same capture window as Set Keybind (default Space); the button-down time doubles as the key-down duration, and extended keys (arrows, Home, Delete, …) are synthesized correctly.
+- **Drag action (item 4).** **Drag** presses the chosen button at point A, glides to point B over ~50 ms, pauses for the button-down time, and releases. "Set drag points" closes the settings window and covers the screen with a dark overlay: click A, click B, done (Esc cancels). A drag always completes its release once started. Until points are set, the Drag action does nothing.
+- **Random interval range (item 6).** With Random on, each cycle's interval is picked uniformly between the base interval and "Max ms". (If the max is unset or below the base, the base is used.)
+- **Speed ramp (item 8).** With Ramp on, the interval eases linearly from the base to "Ramp to ms" over the chosen number of seconds at the start of every run — wind a clicker up or down smoothly. Ramp and Random don't combine (ramp wins); jitter still applies on top of either.
+
+One behaviour clarification: Hold mode applies to the mouse-click actions (Single/Double/Burst), as it always has in effect. With a Scroll, Key, or Drag action selected, both modes repeat cycles on the interval — there is no button to "hold" in those actions. The click counter counts every action sent (each scroll cycle, key press, and drag counts once).
+
+Config files from every earlier version load unchanged — scroll defaults to +1 notch, the repeat key to Space, drag points unset, random and ramp off.
+
 ## 0.6.0 — 2026-10-25
 
 Slice 1 of the 50-enhancement program (docs/PROGRAM-50.md): the DPI fix plus the click-action foundation.
