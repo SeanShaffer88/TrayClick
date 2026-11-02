@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.0
+## 0.10.0 — 2026-11-01
 
 A conformance release: no clicking changes, but where settings live, what the command line can do, and how releases are packaged all changed.
 
