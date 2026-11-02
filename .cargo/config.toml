@@ -1,0 +1,11 @@
+# Link the MSVC C runtime statically (+crt-static) so shipped binaries
+# need no separate VC++ redistributable install (Core Engineering
+# Contract V2.0). Applies to every MSVC target the crate is built for.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
