@@ -41,28 +41,6 @@ jobs:
           # Release names follow TrayClick-v<version>-x64-* since 0.10.0.
           Rename-Item "dist/TrayClick-Setup-$tag-x64.exe" "TrayClick-$tag-x64-Setup.exe"
           Get-ChildItem dist | Select-Object Name, Length
-      - name: Package MSI (WiX)
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $ver = $tag -replace '^v', ''
-          $candle = $null
-          $light = $null
-          if ($env:WIX) {
-            $c = Join-Path $env:WIX "bin\candle.exe"
-            $l = Join-Path $env:WIX "bin\light.exe"
-            if (Test-Path $c) { $candle = $c; $light = $l }
-          }
-          if (-not $candle) {
-            $candle = (Get-Command candle.exe -ErrorAction SilentlyContinue).Source
-            $light = (Get-Command light.exe -ErrorAction SilentlyContinue).Source
-          }
-          if (-not $candle) { throw "WiX candle.exe not found (neither `$env:WIX\bin nor PATH)" }
-          & $candle -ext WixUIExtension "-dAppVersion=$ver" installer/TrayClick.wxs -out "dist/TrayClick.wixobj"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $light -ext WixUIExtension -b installer "dist/TrayClick.wixobj" -out "dist/TrayClick-$tag-x64-Setup.msi"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-ChildItem dist | Select-Object Name, Length
       - name: Package portable zip
         shell: pwsh
         run: |
@@ -80,7 +58,6 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $assets = @(
             "TrayClick-$tag-x64-Setup.exe",
-            "TrayClick-$tag-x64-Setup.msi",
             "TrayClick-$tag-x64-Portable.zip"
           )
           $lines = foreach ($name in $assets) {
@@ -94,6 +71,5 @@ jobs:
         with:
           files: |
             dist/TrayClick-*-x64-Setup.exe
-            dist/TrayClick-*-x64-Setup.msi
             dist/TrayClick-*-x64-Portable.zip
             dist/SHA256SUMS.txt
