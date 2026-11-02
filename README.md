@@ -6,14 +6,15 @@ A tiny Windows tray auto clicker. TrayClick sits in the notification area with n
 
 - Windows 10 or later, x64
 - One small executable (installer or portable); the keybind and interval are all you have to set
-- The keybind and interval you pick are remembered between runs (`%APPDATA%\TrayClick\config.json`)
+- The keybind and interval you pick are remembered between runs (`data\config.json` next to the exe)
 
 ## Download
 
-Every [release](https://github.com/SeanShaffer88/TrayClick/releases) provides exactly two downloads:
+Every [release](https://github.com/SeanShaffer88/TrayClick/releases) provides three downloads, plus a `SHA256SUMS.txt` checksum file:
 
-- **Installer** — `TrayClick-Setup-v<version>-x64.exe`: per-user install (no admin), Start menu shortcut, uninstaller in Windows Settings. Your settings survive uninstall; they're in `%APPDATA%\TrayClick`.
-- **Portable zip** — `TrayClick-v<version>-portable.zip`: the portable exe, the license, and a short portable note. No install — unzip, run the exe from anywhere.
+- **Installer** — `TrayClick-v<version>-x64-Setup.exe`: per-user install (no admin), Start menu shortcut, uninstaller in Windows Settings. Your settings survive uninstall; they're in a `data` folder next to the exe, which the installer and uninstaller never touch.
+- **MSI installer** — `TrayClick-v<version>-x64-Setup.msi`: the same per-user install in Windows Installer form, for managed deployments.
+- **Portable zip** — `TrayClick-v<version>-x64-Portable.zip`: `trayclick.exe`, the README, the license, and a short portable note. No install — unzip, run the exe from anywhere.
 
 The builds are unsigned, so Windows SmartScreen may warn on first run: "More info" → "Run anyway".
 
@@ -38,7 +39,7 @@ While clicking is on in the default Follow target, clicking follows your cursor 
 - Only one copy runs at a time; starting a second copy just tells you it's already running. Unless you give it a command: `TrayClick.exe --start`, `--stop`, or `--toggle` forwards the command to the running copy and exits (with no copy running, `--start`/`--toggle` launch it already clicking). `--profile <name>` forwards a profile name the same way — profiles arrive in v1.0.0.
 - TrayClick clicks with the standard Windows `SendInput` API at the current cursor position. It does not move the cursor, record anything, or phone home. It works completely offline.
 - The click interval defaults to 100 ms and can be set to 1 ms, 100 ms, or any custom value from 1 to 60000 ms in the Set Interval window. Very small intervals click as fast as Windows can deliver them; the effective rate is bounded by the OS timer and message delivery.
-- Settings — keybind, stop key, hotkey mode, interval, mouse button, jitter, mode, target, lock point, sequence points, named slots, click offset, pixel check, region guard, foreground app, fullscreen pause, auto-stop limit, start-on-launch, action, burst count/gap, button-down time, alternation, scroll amount, repeat key, drag points, random range, and ramp — are saved in `%APPDATA%\TrayClick\config.json` and survive restarts. Config files from every earlier version load unchanged. (The delayed start is the one exception: it's a one-shot countdown and is never saved.)
+- Settings — keybind, stop key, hotkey mode, interval, mouse button, jitter, mode, target, lock point, sequence points, named slots, click offset, pixel check, region guard, foreground app, fullscreen pause, auto-stop limit, start-on-launch, action, burst count/gap, button-down time, alternation, scroll amount, repeat key, drag points, random range, and ramp — are saved in `data\config.json` next to the exe and survive restarts. Config files from every earlier version load unchanged, and a config left by an earlier version at the old location (`%APPDATA%\TrayClick\config.json`) is copied to the new one automatically on first run. To delete your settings completely, run `trayclick.exe --clean`. (The delayed start is the one exception: it's a one-shot countdown and is never saved.)
 - TrayClick is per-monitor DPI aware, so locked-position clicks land exactly on scaled (e.g. 150%) displays.
 
 ## Screenshots

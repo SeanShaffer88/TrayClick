@@ -22,13 +22,12 @@ jobs:
           cargo test --locked
       - name: Build release
         run: cargo build --release --locked
-      - name: Package portable exe + installer
+      - name: Package installer (Inno Setup)
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $ver = $tag -replace '^v', ''
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/trayclick.exe "dist/TrayClick-$tag-portable.exe"
           $iscc = @(
             "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
             "C:\Program Files\Inno Setup 6\ISCC.exe"
@@ -39,21 +38,62 @@ jobs:
           }
           & $iscc "/DAppVersion=$ver" "/DTagName=$tag" installer/TrayClick.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Release names follow TrayClick-v<version>-x64-* since 0.10.0.
+          Rename-Item "dist/TrayClick-Setup-$tag-x64.exe" "TrayClick-$tag-x64-Setup.exe"
+          Get-ChildItem dist | Select-Object Name, Length
+      - name: Package MSI (WiX)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag -replace '^v', ''
+          $candle = $null
+          $light = $null
+          if ($env:WIX) {
+            $c = Join-Path $env:WIX "bin\candle.exe"
+            $l = Join-Path $env:WIX "bin\light.exe"
+            if (Test-Path $c) { $candle = $c; $light = $l }
+          }
+          if (-not $candle) {
+            $candle = (Get-Command candle.exe -ErrorAction SilentlyContinue).Source
+            $light = (Get-Command light.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $candle) { throw "WiX candle.exe not found (neither `$env:WIX\bin nor PATH)" }
+          & $candle -ext WixUIExtension "-dAppVersion=$ver" installer/TrayClick.wxs -out "dist/TrayClick.wixobj"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $light -ext WixUIExtension -b installer "dist/TrayClick.wixobj" -out "dist/TrayClick-$tag-x64-Setup.msi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist | Select-Object Name, Length
       - name: Package portable zip
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $port = Get-ChildItem "dist/TrayClick-*-portable.exe" | Select-Object -First 1
           New-Item -ItemType Directory -Force -Path "dist/portable" | Out-Null
-          Copy-Item $port.FullName "dist/portable/"
+          Copy-Item target/release/trayclick.exe "dist/portable/"
+          Copy-Item README.md "dist/portable/"
           Copy-Item LICENSE "dist/portable/"
           Copy-Item PORTABLE.txt "dist/portable/"
-          Compress-Archive -Path "dist/portable/*" -DestinationPath "dist/TrayClick-$tag-portable.zip"
+          Compress-Archive -Path "dist/portable/*" -DestinationPath "dist/TrayClick-$tag-x64-Portable.zip"
           Get-ChildItem dist | Select-Object Name, Length
+      - name: Write SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $assets = @(
+            "TrayClick-$tag-x64-Setup.exe",
+            "TrayClick-$tag-x64-Setup.msi",
+            "TrayClick-$tag-x64-Portable.zip"
+          )
+          $lines = foreach ($name in $assets) {
+            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name"
+          }
+          $lines | Set-Content "dist/SHA256SUMS.txt" -Encoding ascii
+          Get-Content "dist/SHA256SUMS.txt"
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/TrayClick-Setup-*.exe
-            dist/TrayClick-*-portable.zip
+            dist/TrayClick-*-x64-Setup.exe
+            dist/TrayClick-*-x64-Setup.msi
+            dist/TrayClick-*-x64-Portable.zip
+            dist/SHA256SUMS.txt

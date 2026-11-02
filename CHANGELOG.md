@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0
+
+A conformance release: no clicking changes, but where settings live, what the command line can do, and how releases are packaged all changed.
+
+- **Settings moved next to the exe.** Settings now live in `data\config.json` beside the executable, for the portable and installed builds alike. A config from an earlier version at `%APPDATA%\TrayClick\config.json` is copied to the new location automatically on first run (the old file is left untouched as a backup), and if the folder next to the exe is not writable the old location is used instead, so no settings are lost. Config files from every earlier version still load unchanged.
+- **Command-line maintenance commands.** New local commands that act and exit, without opening the tray: `--help` (usage text), `--version`, `--clean` (delete the settings in both locations, the `data` folder, and the Start with Windows entry), and `--uninstall` (the same data cleanup; program files installed by an installer are still removed through Windows Settings). `--dry-run` prints what `--clean`/`--uninstall` would remove without removing anything, `--silent` keeps output on the console only, and `--json` prints the result as JSON. Both refuse to run while another copy of TrayClick is open. The existing `--start`/`--stop`/`--toggle`/`--profile` control commands are unchanged. TrayClick has no headless mode: clicking is still driven from the tray icon and the keybind.
+- **Static C runtime.** The build now links the MSVC C runtime statically, so the exe no longer depends on a separate VC++ redistributable install.
+- **MSI installer and new release names.** Releases now carry three downloads plus a checksum file: `TrayClick-v<version>-x64-Setup.exe` (the Inno installer, as before), `TrayClick-v<version>-x64-Setup.msi` (a new WiX MSI with the same per-user install), `TrayClick-v<version>-x64-Portable.zip` (the exe under its real name, `trayclick.exe`, with the README, license, and portable note), and `SHA256SUMS.txt`. The old loose portable `.exe` download is gone; its contents are in the portable zip.
+
 ## 0.9.0 — 2026-10-25
 
 Slice 4 of the 50-enhancement program (docs/PROGRAM-50.md): triggers & automation, all on the settings window's Clicking tab (which grew a little taller).

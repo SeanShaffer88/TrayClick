@@ -60,6 +60,14 @@
 //! --toggle, or --profile <name> to the running instance instead of
 //! starting a copy.
 //!
+//! The 0.10.0 work is conformance, not features: settings moved
+//! from `%APPDATA%` to a `data` folder next to the executable (a
+//! config from an older version is copied over automatically on
+//! first run), the build links the C runtime statically, releases
+//! add an MSI installer next to the Inno one, and the CLI gains
+//! local maintenance commands — `--help`, `--version`, `--clean`,
+//! and `--uninstall` — that run before any window exists.
+//!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
 //! indefinitely, until the keybind is pressed again. While clicking is
@@ -89,15 +97,16 @@ mod win {
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        absolute_coord, colour_matches, effective_button, format_count, ico_image_for_size,
-        in_failsafe_corner, is_extended_key, is_valid_burst_clicks, is_valid_burst_gap,
-        is_valid_delay_minutes, is_valid_interval, is_valid_keybind, is_valid_limit,
-        is_valid_offset, is_valid_pixel_tol, is_valid_press_ms, is_valid_ramp_seconds,
-        is_valid_repeat_key, is_valid_scroll_amount, jittered_interval_ms, key_name,
-        next_click_deadline, other_monitor_centre, parse_cli, ramped_interval_ms,
-        rect_is_fullscreen, region_changed, sanitize_slot_name, CliCommand, ClickAction,
-        ClickButton, ClickMode, Config, Engine, KeyPressDetector, KeyReleaseDetector, TargetMode,
-        DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, VK_ESCAPE_CODE,
+        absolute_coord, choose_config_file, colour_matches, effective_button, format_count,
+        ico_image_for_size, in_failsafe_corner, is_extended_key, is_valid_burst_clicks,
+        is_valid_burst_gap, is_valid_delay_minutes, is_valid_interval, is_valid_keybind,
+        is_valid_limit, is_valid_offset, is_valid_pixel_tol, is_valid_press_ms,
+        is_valid_ramp_seconds, is_valid_repeat_key, is_valid_scroll_amount, jittered_interval_ms,
+        key_name, next_click_deadline, other_monitor_centre, parse_cli_full, ramped_interval_ms,
+        rect_is_fullscreen, region_changed, sanitize_slot_name, CliCommand, CliOptions,
+        ClickAction, ClickButton, ClickMode, Config, ConfigChoice, Engine, KeyPressDetector,
+        KeyReleaseDetector, TargetMode, DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, USAGE,
+        VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR, PWSTR};
@@ -110,6 +119,7 @@ mod win {
         ReleaseDC, SetBkMode, SetTextColor, HBRUSH, HDC, HMONITOR, MONITORINFO,
         MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Registry::{
@@ -433,11 +443,64 @@ mod win {
 
     // ---------- config persistence ----------
 
-    fn config_path() -> PathBuf {
+    /// Where every version before 0.10.0 kept the config:
+    /// `%APPDATA%\TrayClick\config.json`.
+    fn legacy_config_path() -> PathBuf {
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         base.join("TrayClick").join("config.json")
+    }
+
+    /// The directory the running executable lives in.
+    fn exe_dir() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The portable config location since 0.10.0: `data\config.json`
+    /// next to the executable, for portable and installed builds
+    /// alike (the installer is per-user, so the folder is writable).
+    fn portable_config_path() -> PathBuf {
+        exe_dir().join("data").join("config.json")
+    }
+
+    /// The config file this launch uses, resolved once: see
+    /// [`choose_config_file`] for the decision. A legacy file the
+    /// choice says to migrate is copied over here, best-effort,
+    /// before anything reads the chosen path.
+    fn config_choice() -> &'static ConfigChoice {
+        static CHOICE: OnceLock<ConfigChoice> = OnceLock::new();
+        CHOICE.get_or_init(|| {
+            let portable = portable_config_path();
+            let legacy = legacy_config_path();
+            let portable_exists = portable.exists();
+            // Creating the data dir is the writability probe; it is
+            // skipped when a portable config already exists (the
+            // choice ignores writability in that case anyway).
+            let portable_dir_writable = portable_exists
+                || portable
+                    .parent()
+                    .map(|d| std::fs::create_dir_all(d).is_ok())
+                    .unwrap_or(false);
+            let choice = choose_config_file(
+                &portable,
+                &legacy,
+                portable_exists,
+                legacy.exists(),
+                portable_dir_writable,
+            );
+            if let Some(from) = &choice.migrate_from {
+                let _ = std::fs::copy(from, &choice.path);
+            }
+            choice
+        })
+    }
+
+    fn config_path() -> PathBuf {
+        config_choice().path.clone()
     }
 
     fn load_config() -> Config {
@@ -5015,9 +5078,203 @@ mod win {
                         Some(LPARAM(&cds as *const COPYDATASTRUCT as isize)),
                     );
                 }
+                // Maintenance commands never reach forwarding: `run`
+                // handles them before this is called.
+                _ => return false,
             }
             true
         }
+    }
+
+    // ---------- CLI maintenance commands (0.10.0) ----------
+
+    /// The single-instance mutex name. Changed in 0.10.0 from the
+    /// plain "TrayClickSingleInstance" to a GUID-form name so it
+    /// cannot collide with another program's mutex.
+    const INSTANCE_MUTEX_NAME: &str = "TrayClick-{62C29D04-266D-4455-AFE3-C19063EF7C82}";
+
+    /// True when another copy of TrayClick is already running (it
+    /// holds the single-instance mutex). This is only a probe — the
+    /// handle is closed again before returning; the real instance
+    /// claim happens in `run`.
+    fn another_instance_running() -> bool {
+        let name = wide(INSTANCE_MUTEX_NAME);
+        let probe = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) };
+        let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if let Ok(handle) = probe {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+        already
+    }
+
+    /// Print a maintenance command's output: to the parent console
+    /// when there is one (the normal case for a command-line
+    /// launch), else in a message box — unless `--silent` was
+    /// given, which keeps everything on the console channel (and so
+    /// shows nothing when there is no console).
+    fn cli_output(text: &str, opts: &CliOptions) {
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+        use std::io::Write;
+        if let Ok(mut con) = std::fs::File::options().write(true).open("CONOUT$") {
+            let _ = writeln!(con, "{text}");
+            let _ = con.flush();
+            return;
+        }
+        if !opts.silent {
+            let text_w = wide(text);
+            let title_w = wide("TrayClick");
+            unsafe {
+                MessageBoxW(
+                    None,
+                    PCWSTR(text_w.as_ptr()),
+                    PCWSTR(title_w.as_ptr()),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        }
+    }
+
+    /// Minimal JSON string escaping for the small objects the
+    /// maintenance commands print with `--json`.
+    fn json_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The `--version` output, as a text line or a JSON object.
+    fn version_text(json: bool) -> String {
+        let version = env!("CARGO_PKG_VERSION");
+        if json {
+            format!("{{\"name\":\"TrayClick\",\"version\":\"{version}\"}}")
+        } else {
+            format!("TrayClick {version}")
+        }
+    }
+
+    /// Delete one file or folder if it exists, recording its path
+    /// in `removed`. With `dry_run`, record without deleting.
+    fn remove_target(
+        path: &std::path::Path,
+        is_dir: bool,
+        dry_run: bool,
+        removed: &mut Vec<String>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        if !dry_run {
+            let deleted = if is_dir {
+                std::fs::remove_dir_all(path).is_ok()
+            } else {
+                std::fs::remove_file(path).is_ok()
+            };
+            if !deleted {
+                return;
+            }
+        }
+        removed.push(path.display().to_string());
+    }
+
+    /// Shared body of `--clean` and `--uninstall`: delete the
+    /// settings files at both locations, the `data` folder, the
+    /// legacy settings folder, and the Start with Windows entry.
+    /// Returns the process exit code: 1 when refused because another
+    /// copy is running (a live copy's config is never touched), else
+    /// 0. `--uninstall` differs only in its closing note — program
+    /// files placed by the installer are removed through Windows
+    /// Settings, not from here.
+    fn run_cleanup(uninstall: bool, dry_run: bool, opts: &CliOptions) -> i32 {
+        let command = if uninstall { "uninstall" } else { "clean" };
+        if another_instance_running() {
+            if opts.json {
+                cli_output(
+                    &format!("{{\"command\":\"{command}\",\"error\":\"already-running\"}}"),
+                    opts,
+                );
+            } else {
+                cli_output(
+                    "TrayClick is already running. Quit it from the tray, then try again.",
+                    opts,
+                );
+            }
+            return 1;
+        }
+
+        let mut removed: Vec<String> = Vec::new();
+        let portable = portable_config_path();
+        if let Some(data_dir) = portable.parent() {
+            remove_target(&portable, false, dry_run, &mut removed);
+            remove_target(data_dir, true, dry_run, &mut removed);
+        }
+        let legacy = legacy_config_path();
+        if let Some(legacy_dir) = legacy.parent() {
+            remove_target(&legacy, false, dry_run, &mut removed);
+            remove_target(legacy_dir, true, dry_run, &mut removed);
+        }
+        if autostart_value().is_some() {
+            if !dry_run {
+                set_autostart(false);
+            }
+            removed.push("Start with Windows entry (HKCU Run value)".to_string());
+        }
+
+        if opts.json {
+            let items: Vec<String> = removed
+                .iter()
+                .map(|r| format!("\"{}\"", json_escape(r)))
+                .collect();
+            cli_output(
+                &format!(
+                    "{{\"command\":\"{command}\",\"dry_run\":{dry_run},\"removed\":[{}]}}",
+                    items.join(",")
+                ),
+                opts,
+            );
+            return 0;
+        }
+
+        let mut text = String::new();
+        if dry_run {
+            text.push_str("Dry run - nothing was changed.\n");
+        }
+        if removed.is_empty() {
+            text.push_str("Nothing to remove: no TrayClick settings or sign-in entry found.");
+        } else {
+            text.push_str(if dry_run {
+                "Would remove:\n"
+            } else {
+                "Removed:\n"
+            });
+            for item in &removed {
+                text.push_str("  ");
+                text.push_str(item);
+                text.push('\n');
+            }
+            text = text.trim_end().to_string();
+        }
+        if uninstall {
+            text.push_str(
+                "\nProgram files installed by the installer are not removed here; \
+                 uninstall TrayClick from Windows Settings > Apps to remove them.",
+            );
+        }
+        cli_output(&text, opts);
+        0
     }
 
     pub fn run() {
@@ -5034,7 +5291,26 @@ mod win {
         // instance running, --start/--toggle/--profile launch the app
         // (starting clicking for start/toggle); --stop does nothing.
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let cli = parse_cli(&args);
+        let (cli, cli_opts) = parse_cli_full(&args);
+        // Maintenance commands (0.10.0) act locally and exit, before
+        // anything is forwarded and before any window is created.
+        match &cli {
+            Some(CliCommand::Help) => {
+                cli_output(USAGE, &cli_opts);
+                return;
+            }
+            Some(CliCommand::Version) => {
+                cli_output(&version_text(cli_opts.json), &cli_opts);
+                return;
+            }
+            Some(CliCommand::Clean { dry_run }) => {
+                std::process::exit(run_cleanup(false, *dry_run, &cli_opts));
+            }
+            Some(CliCommand::Uninstall { dry_run }) => {
+                std::process::exit(run_cleanup(true, *dry_run, &cli_opts));
+            }
+            _ => {}
+        }
         let mut cli_start = false;
         if let Some(cmd) = &cli {
             if forward_cli(cmd) {
@@ -5048,6 +5324,12 @@ mod win {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = name.clone();
                 }
+                // Maintenance commands returned or exited in the match
+                // above; they never reach this one.
+                CliCommand::Help
+                | CliCommand::Version
+                | CliCommand::Clean { .. }
+                | CliCommand::Uninstall { .. } => {}
             }
         }
 
@@ -5058,7 +5340,8 @@ mod win {
         // was reviewed as if the handle closed when its block ended —
         // it never did; keeping the binding simply makes the lifetime
         // explicit and guarantees nothing closes it early.)
-        let instance_mutex = unsafe { CreateMutexW(None, true, w!("TrayClickSingleInstance")) };
+        let mutex_name = wide(INSTANCE_MUTEX_NAME);
+        let instance_mutex = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) };
         // Whether the call itself reports Ok or Err, ERROR_ALREADY_EXISTS
         // is the signal that another copy holds the name.
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {

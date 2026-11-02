@@ -4,6 +4,7 @@
 //! This module is platform-independent so it can be unit-tested anywhere.
 //! All Win32 code lives in `main.rs`.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Default click interval: the mouse clicks every 100 ms while on.
@@ -620,42 +621,153 @@ pub fn rect_is_fullscreen(win: (i32, i32, i32, i32), mon: (i32, i32, i32, i32)) 
     win.0 <= mon.0 && win.1 <= mon.1 && win.2 >= mon.2 && win.3 >= mon.3
 }
 
-/// A command-line instruction for the running instance (item 25).
-/// A second launch parses its arguments into one of these and
-/// forwards it instead of starting a second copy.
+/// Output modifiers that can accompany any command (0.10.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CliOptions {
+    /// With `--clean`/`--uninstall`: print the plan, change nothing.
+    pub dry_run: bool,
+    /// No dialog fallback: console output only.
+    pub silent: bool,
+    /// Print results as a small JSON object instead of text lines.
+    pub json: bool,
+}
+
+/// A command-line instruction (item 25, extended in 0.10.0). The
+/// control commands (`Start`/`Stop`/`Toggle`/`Profile`) are for the
+/// running instance: a second launch parses its arguments into one
+/// of these and forwards it instead of starting a second copy. The
+/// maintenance commands (`Help`/`Version`/`Clean`/`Uninstall`) act
+/// locally and exit before any window is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     Start,
     Stop,
     Toggle,
     Profile(String),
+    Help,
+    Version,
+    Clean { dry_run: bool },
+    Uninstall { dry_run: bool },
 }
 
-/// Parse command-line arguments into a [`CliCommand`]. The first
-/// recognised flag wins; `--profile` takes the following argument
-/// as the profile name (validated with the slot-name charset —
-/// profile names follow the same rules). Unrecognised arguments
-/// are ignored, and plain launches return `None`.
-pub fn parse_cli(args: &[String]) -> Option<CliCommand> {
+/// Parse command-line arguments into a [`CliCommand`] plus its
+/// output modifiers.
+///
+/// Maintenance commands win over control commands when both appear.
+/// Otherwise the first recognised control flag wins; `--profile`
+/// takes the following argument as the profile name (validated with
+/// the slot-name charset — profile names follow the same rules).
+/// Unrecognised arguments are ignored, and plain launches return
+/// `None` as the command.
+pub fn parse_cli_full(args: &[String]) -> (Option<CliCommand>, CliOptions) {
+    let mut opts = CliOptions::default();
+    let mut maintenance: Option<CliCommand> = None;
+    let mut help = false;
+    let mut version = false;
+    for arg in args {
+        match arg.as_str() {
+            "--dry-run" => opts.dry_run = true,
+            "--silent" => opts.silent = true,
+            "--json" => opts.json = true,
+            "--clean" if maintenance.is_none() => {
+                maintenance = Some(CliCommand::Clean { dry_run: false });
+            }
+            "--uninstall" if maintenance.is_none() => {
+                maintenance = Some(CliCommand::Uninstall { dry_run: false });
+            }
+            "--help" => help = true,
+            "--version" => version = true,
+            _ => {}
+        }
+    }
+    if let Some(cmd) = maintenance {
+        let cmd = match cmd {
+            CliCommand::Clean { .. } => CliCommand::Clean {
+                dry_run: opts.dry_run,
+            },
+            CliCommand::Uninstall { .. } => CliCommand::Uninstall {
+                dry_run: opts.dry_run,
+            },
+            other => other,
+        };
+        return (Some(cmd), opts);
+    }
+    if help {
+        return (Some(CliCommand::Help), opts);
+    }
+    if version {
+        return (Some(CliCommand::Version), opts);
+    }
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--start" => return Some(CliCommand::Start),
-            "--stop" => return Some(CliCommand::Stop),
-            "--toggle" => return Some(CliCommand::Toggle),
+            "--start" => return (Some(CliCommand::Start), opts),
+            "--stop" => return (Some(CliCommand::Stop), opts),
+            "--toggle" => return (Some(CliCommand::Toggle), opts),
             "--profile" => {
-                let name = args.get(i + 1)?;
+                let Some(name) = args.get(i + 1) else {
+                    return (None, opts);
+                };
                 if is_valid_slot_name(name) && !name.trim().is_empty() {
-                    return Some(CliCommand::Profile(name.clone()));
+                    return (Some(CliCommand::Profile(name.clone())), opts);
                 }
-                return None;
+                return (None, opts);
             }
             _ => {}
         }
         i += 1;
     }
-    None
+    (None, opts)
 }
+
+/// Parse command-line arguments into a control [`CliCommand`] for
+/// the running instance (the original item-25 entry point).
+/// Maintenance commands and modifiers are not reported here — use
+/// [`parse_cli_full`] for the whole picture — so a launch carrying
+/// e.g. `--clean` reads as "no control command", exactly as an
+/// unrecognised flag did before 0.10.0.
+pub fn parse_cli(args: &[String]) -> Option<CliCommand> {
+    match parse_cli_full(args).0 {
+        Some(
+            cmd @ (CliCommand::Start
+            | CliCommand::Stop
+            | CliCommand::Toggle
+            | CliCommand::Profile(_)),
+        ) => Some(cmd),
+        _ => None,
+    }
+}
+
+/// Usage text for `--help`: every command TrayClick understands.
+pub const USAGE: &str = "\
+TrayClick - Windows tray auto clicker
+
+Usage: trayclick.exe [command] [modifiers]
+
+Control commands (forwarded to the running copy; with no copy
+running, --start/--toggle launch the app already clicking):
+  --start            Start clicking
+  --stop             Stop clicking
+  --toggle           Toggle clicking
+  --profile <name>   Send a profile name to the running copy
+
+Maintenance commands (act locally and exit):
+  --help             Show this text
+  --version          Show the version
+  --clean            Delete the settings files (both locations),
+                     the data folder, and the Start with Windows
+                     entry
+  --uninstall        Like --clean; program files installed by the
+                     installer are removed via Windows Settings
+
+Modifiers:
+  --dry-run          With --clean/--uninstall: print the plan,
+                     change nothing
+  --silent           No dialog fallback; console output only
+  --json             Print results as JSON
+
+With no command, TrayClick runs in the tray. It has no headless
+mode: clicking is driven from the tray icon and the keybind.";
 
 /// Pick the image bytes of the best-matching entry in an `.ico` file.
 ///
@@ -772,6 +884,56 @@ pub fn key_name(vk: u32) -> String {
         0x30..=0x39 => ((vk as u8) as char).to_string(),
         0x41..=0x5A => ((vk as u8) as char).to_string(),
         _ => format!("Key 0x{vk:02X}"),
+    }
+}
+
+/// The outcome of choosing which config file this launch reads and
+/// writes (0.10.0). `path` is the file to use; `migrate_from`, when
+/// set, is an older config file the caller should copy to `path`
+/// first (best-effort) so the user's settings follow the move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChoice {
+    pub path: PathBuf,
+    pub migrate_from: Option<PathBuf>,
+}
+
+/// Decide between the portable config (a `data\config.json` next to
+/// the executable — used by both the portable and the installed
+/// build since 0.10.0) and the legacy one
+/// (`%APPDATA%\TrayClick\config.json`, where every version before
+/// 0.10.0 kept it).
+///
+/// An existing portable file always wins. Otherwise the portable
+/// location is used when its directory is writable, copying the
+/// legacy file over first when one exists. The legacy location is
+/// the fallback for an unwritable install directory, so settings
+/// are never lost either way.
+pub fn choose_config_file(
+    portable: &Path,
+    legacy: &Path,
+    portable_exists: bool,
+    legacy_exists: bool,
+    portable_dir_writable: bool,
+) -> ConfigChoice {
+    if portable_exists {
+        ConfigChoice {
+            path: portable.to_path_buf(),
+            migrate_from: None,
+        }
+    } else if portable_dir_writable {
+        ConfigChoice {
+            path: portable.to_path_buf(),
+            migrate_from: if legacy_exists {
+                Some(legacy.to_path_buf())
+            } else {
+                None
+            },
+        }
+    } else {
+        ConfigChoice {
+            path: legacy.to_path_buf(),
+            migrate_from: None,
+        }
     }
 }
 
@@ -1689,6 +1851,106 @@ mod tests {
             parse_cli(&a(&["--bogus", "--start"])),
             Some(CliCommand::Start)
         );
+    }
+
+    #[test]
+    fn cli_maintenance_parsing() {
+        let a = |s: &[&str]| -> Vec<String> { s.iter().map(|x| x.to_string()).collect() };
+        // Maintenance commands parse through the full entry point...
+        assert_eq!(parse_cli_full(&a(&["--help"])).0, Some(CliCommand::Help));
+        assert_eq!(
+            parse_cli_full(&a(&["--version"])).0,
+            Some(CliCommand::Version)
+        );
+        assert_eq!(
+            parse_cli_full(&a(&["--clean"])).0,
+            Some(CliCommand::Clean { dry_run: false })
+        );
+        assert_eq!(
+            parse_cli_full(&a(&["--uninstall"])).0,
+            Some(CliCommand::Uninstall { dry_run: false })
+        );
+        // ...with --dry-run in any order.
+        assert_eq!(
+            parse_cli_full(&a(&["--clean", "--dry-run"])).0,
+            Some(CliCommand::Clean { dry_run: true })
+        );
+        assert_eq!(
+            parse_cli_full(&a(&["--dry-run", "--clean"])).0,
+            Some(CliCommand::Clean { dry_run: true })
+        );
+        assert_eq!(
+            parse_cli_full(&a(&["--dry-run", "--uninstall"])).0,
+            Some(CliCommand::Uninstall { dry_run: true })
+        );
+        // Maintenance wins over control commands.
+        assert_eq!(
+            parse_cli_full(&a(&["--start", "--clean"])).0,
+            Some(CliCommand::Clean { dry_run: false })
+        );
+        assert_eq!(
+            parse_cli_full(&a(&["--toggle", "--version"])).0,
+            Some(CliCommand::Version)
+        );
+        // Control commands still parse, with modifiers attached.
+        let (cmd, opts) = parse_cli_full(&a(&["--silent", "--json", "--start"]));
+        assert_eq!(cmd, Some(CliCommand::Start));
+        assert!(opts.silent && opts.json && !opts.dry_run);
+        // The control-only entry point ignores maintenance commands.
+        assert_eq!(parse_cli(&a(&["--clean"])), None);
+        assert_eq!(parse_cli(&a(&["--help"])), None);
+        assert_eq!(parse_cli(&a(&["--version"])), None);
+        // Unknown args alone still mean a plain launch.
+        assert_eq!(parse_cli_full(&a(&["--bogus"])).0, None);
+        assert_eq!(parse_cli_full(&a(&[])).0, None);
+    }
+
+    #[test]
+    fn usage_lists_every_flag() {
+        for flag in [
+            "--start",
+            "--stop",
+            "--toggle",
+            "--profile",
+            "--help",
+            "--version",
+            "--clean",
+            "--uninstall",
+            "--dry-run",
+            "--silent",
+            "--json",
+        ] {
+            assert!(USAGE.contains(flag), "USAGE is missing {flag}");
+        }
+    }
+
+    #[test]
+    fn config_file_choice() {
+        let portable = Path::new("exe").join("data").join("config.json");
+        let legacy = Path::new("appdata").join("TrayClick").join("config.json");
+        // An existing portable file always wins, no migration.
+        let c = choose_config_file(&portable, &legacy, true, true, false);
+        assert_eq!(c.path, portable);
+        assert_eq!(c.migrate_from, None);
+        let c = choose_config_file(&portable, &legacy, true, false, true);
+        assert_eq!(c.path, portable);
+        assert_eq!(c.migrate_from, None);
+        // Writable portable dir: use it, migrating a legacy file.
+        let c = choose_config_file(&portable, &legacy, false, true, true);
+        assert_eq!(c.path, portable);
+        assert_eq!(c.migrate_from, Some(legacy.clone()));
+        // Writable portable dir, nothing to migrate.
+        let c = choose_config_file(&portable, &legacy, false, false, true);
+        assert_eq!(c.path, portable);
+        assert_eq!(c.migrate_from, None);
+        // Unwritable portable dir: legacy fallback, with or without
+        // an existing legacy file, and never a migration.
+        let c = choose_config_file(&portable, &legacy, false, true, false);
+        assert_eq!(c.path, legacy);
+        assert_eq!(c.migrate_from, None);
+        let c = choose_config_file(&portable, &legacy, false, false, false);
+        assert_eq!(c.path, legacy);
+        assert_eq!(c.migrate_from, None);
     }
 
     #[test]

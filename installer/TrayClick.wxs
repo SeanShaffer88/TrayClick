@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TrayClick MSI installer (WiX Toolset v3).
+
+  Built by the Release workflow next to the Inno Setup installer:
+    candle.exe -dAppVersion=<x.y.z> installer\TrayClick.wxs
+    light.exe ... -out dist\TrayClick-v<x.y.z>-x64-Setup.msi
+
+  Mirrors installer\TrayClick.iss: a per-user install (no admin)
+  into LocalAppData\Programs\TrayClick with a Start menu shortcut.
+  Per-user is expressed the WiX v3 way: ALLUSERS=2 with
+  MSIINSTALLPERUSER=1, and every directory under LocalAppDataFolder.
+
+  UpgradeCode (fixed for the life of the product; upgrades replace
+  older versions in place):
+    A1EC5B41-2EBD-4A59-93E2-E12DDA24EE01
+  This is deliberately NOT the Inno AppId
+  (B7C4A2E1-5D38-4F6A-9C21-8E0D3A5F7B42 from TrayClick.iss): the two
+  installers are separate products and must not share an identity.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="TrayClick"
+           Language="1033"
+           Version="$(var.AppVersion)"
+           Manufacturer="Sean Shaffer"
+           UpgradeCode="A1EC5B41-2EBD-4A59-93E2-E12DDA24EE01">
+    <Package InstallerVersion="200"
+             Compressed="yes"
+             Platform="x64"
+             Manufacturer="Sean Shaffer"
+             Description="TrayClick - Windows tray auto clicker" />
+
+    <!-- Per-user install (WiX v3 form): prefer per-user, and set the
+         per-user mode for the install. -->
+    <Property Id="ALLUSERS" Value="2" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Standard upgrade/uninstall behaviour: newer versions replace
+         older ones, downgrades are refused, and uninstall removes
+         the files and shortcut (settings in the data folder next to
+         the exe are not the installer's and are left alone). -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of TrayClick is already installed." />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsDir" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="TrayClick">
+            <!-- Per-user components: ICE38 requires an HKCU registry
+                 value as each component's KeyPath (not the file), and
+                 ICE64 requires the profile directories in the
+                 RemoveFile table (the RemoveFolder entries). -->
+            <Component Id="TrayClickExeComponent" Guid="294874A9-F179-4811-9442-3C425B495686">
+              <File Id="TrayClickExe"
+                    Source="..\target\release\trayclick.exe" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\Sean Shaffer\TrayClick"
+                             Name="exeInstalled"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
+              <RemoveFolder Id="RemoveInstallFolder"
+                            Directory="INSTALLFOLDER"
+                            On="uninstall" />
+              <RemoveFolder Id="RemoveProgramsDir"
+                            Directory="ProgramsDir"
+                            On="uninstall" />
+            </Component>
+            <Component Id="ReadmeComponent" Guid="C3FE77DE-F8E5-4D65-A21C-B2A881A4F605">
+              <File Id="ReadmeFile"
+                    Source="..\README.md" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\Sean Shaffer\TrayClick"
+                             Name="readmeInstalled"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
+            </Component>
+            <Component Id="LicenseComponent" Guid="D55A13A0-F901-4129-BAB6-7996560A82E8">
+              <File Id="LicenseFile"
+                    Source="..\LICENSE" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\Sean Shaffer\TrayClick"
+                             Name="licenseInstalled"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppShortcutFolder" Name="TrayClick">
+          <Component Id="ShortcutComponent" Guid="7430DA04-1F3B-488A-A8E9-45307E9AC3C4">
+            <Shortcut Id="TrayClickShortcut"
+                      Name="TrayClick"
+                      Description="TrayClick auto clicker"
+                      Target="[INSTALLFOLDER]trayclick.exe"
+                      WorkingDirectory="INSTALLFOLDER" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\Sean Shaffer\TrayClick"
+                           Name="installed"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+            <RemoveFolder Id="RemoveAppShortcutFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="TrayClick" Level="1">
+      <ComponentRef Id="TrayClickExeComponent" />
+      <ComponentRef Id="ReadmeComponent" />
+      <ComponentRef Id="LicenseComponent" />
+      <ComponentRef Id="ShortcutComponent" />
+    </Feature>
+
+    <Property Id="WixLicenseFile" Value="..\LICENSE" />
+    <UIRef Id="WixUI_Minimal" />
+  </Product>
+</Wix>
