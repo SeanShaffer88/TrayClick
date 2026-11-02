@@ -10,10 +10,9 @@ A tiny Windows tray auto clicker. TrayClick sits in the notification area with n
 
 ## Download
 
-Every [release](https://github.com/SeanShaffer88/TrayClick/releases) provides three downloads, plus a `SHA256SUMS.txt` checksum file:
+Every [release](https://github.com/SeanShaffer88/TrayClick/releases) provides two downloads, plus a `SHA256SUMS.txt` checksum file:
 
 - **Installer** — `TrayClick-v<version>-x64-Setup.exe`: per-user install (no admin), Start menu shortcut, uninstaller in Windows Settings. Your settings survive uninstall; they're in a `data` folder next to the exe, which the installer and uninstaller never touch.
-- **MSI installer** — `TrayClick-v<version>-x64-Setup.msi`: the same per-user install in Windows Installer form, for managed deployments.
 - **Portable zip** — `TrayClick-v<version>-x64-Portable.zip`: `trayclick.exe`, the README, the license, and a short portable note. No install — unzip, run the exe from anywhere.
 
 The builds are unsigned, so Windows SmartScreen may warn on first run: "More info" → "Run anyway".
