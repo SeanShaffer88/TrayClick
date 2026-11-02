@@ -48,20 +48,45 @@
       <Directory Id="LocalAppDataFolder">
         <Directory Id="ProgramsDir" Name="Programs">
           <Directory Id="INSTALLFOLDER" Name="TrayClick">
+            <!-- Per-user components: ICE38 requires an HKCU registry
+                 value as each component's KeyPath (not the file), and
+                 ICE64 requires the profile directories in the
+                 RemoveFile table (the RemoveFolder entries). -->
             <Component Id="TrayClickExeComponent" Guid="*">
               <File Id="TrayClickExe"
-                    Source="..\target\release\trayclick.exe"
-                    KeyPath="yes" />
+                    Source="..\target\release\trayclick.exe" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\Sean Shaffer\TrayClick"
+                             Name="exeInstalled"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
+              <RemoveFolder Id="RemoveInstallFolder"
+                            Directory="INSTALLFOLDER"
+                            On="uninstall" />
+              <RemoveFolder Id="RemoveProgramsDir"
+                            Directory="ProgramsDir"
+                            On="uninstall" />
             </Component>
             <Component Id="ReadmeComponent" Guid="*">
               <File Id="ReadmeFile"
-                    Source="..\README.md"
-                    KeyPath="yes" />
+                    Source="..\README.md" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\Sean Shaffer\TrayClick"
+                             Name="readmeInstalled"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
             </Component>
             <Component Id="LicenseComponent" Guid="*">
               <File Id="LicenseFile"
-                    Source="..\LICENSE"
-                    KeyPath="yes" />
+                    Source="..\LICENSE" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\Sean Shaffer\TrayClick"
+                             Name="licenseInstalled"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
             </Component>
           </Directory>
         </Directory>
