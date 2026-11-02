@@ -52,7 +52,7 @@
                  value as each component's KeyPath (not the file), and
                  ICE64 requires the profile directories in the
                  RemoveFile table (the RemoveFolder entries). -->
-            <Component Id="TrayClickExeComponent" Guid="*">
+            <Component Id="TrayClickExeComponent" Guid="294874A9-F179-4811-9442-3C425B495686">
               <File Id="TrayClickExe"
                     Source="..\target\release\trayclick.exe" />
               <RegistryValue Root="HKCU"
@@ -68,7 +68,7 @@
                             Directory="ProgramsDir"
                             On="uninstall" />
             </Component>
-            <Component Id="ReadmeComponent" Guid="*">
+            <Component Id="ReadmeComponent" Guid="C3FE77DE-F8E5-4D65-A21C-B2A881A4F605">
               <File Id="ReadmeFile"
                     Source="..\README.md" />
               <RegistryValue Root="HKCU"
@@ -78,7 +78,7 @@
                              Value="1"
                              KeyPath="yes" />
             </Component>
-            <Component Id="LicenseComponent" Guid="*">
+            <Component Id="LicenseComponent" Guid="D55A13A0-F901-4129-BAB6-7996560A82E8">
               <File Id="LicenseFile"
                     Source="..\LICENSE" />
               <RegistryValue Root="HKCU"
@@ -93,7 +93,7 @@
       </Directory>
       <Directory Id="ProgramMenuFolder">
         <Directory Id="AppShortcutFolder" Name="TrayClick">
-          <Component Id="ShortcutComponent" Guid="*">
+          <Component Id="ShortcutComponent" Guid="7430DA04-1F3B-488A-A8E9-45307E9AC3C4">
             <Shortcut Id="TrayClickShortcut"
                       Name="TrayClick"
                       Description="TrayClick auto clicker"
