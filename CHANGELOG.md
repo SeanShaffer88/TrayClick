@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0 — 2026-11-02
+
+The first stable release.
+
+- **Update check at launch.** Each time TrayClick starts, it asks GitHub for the latest release. If a newer version exists, a small window in the settings window's charcoal-and-red style offers it: **Download** opens the release page in your browser, **Later** (or closing the window) dismisses it. Nothing is ever downloaded or installed automatically. The check is the program's only network use, and there is no setting for it — it runs at every launch. Offline or unreachable, it quietly does nothing.
+
 ## 0.11.0 — 2026-11-02
 
 - **Auto-stop time limit.** Beside the existing "stop after N clicks" limit, the Clicking page now has "Stop after (seconds, 0 = no limit)": a run stops once it has been going for that many seconds (up to 604800 — seven days). With both limits set, whichever is reached first stops the run. It applies in Hold mode too — the held button is released when the time runs out. The setting is saved as `limit_seconds` in config.json; config files from earlier versions load unchanged (no time limit set).

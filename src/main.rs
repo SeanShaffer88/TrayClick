@@ -107,15 +107,16 @@ mod win {
 
     use trayclick::{
         absolute_coord, auto_stop_reached, choose_config_file, colour_matches, effective_button,
-        format_count, ico_image_for_size, in_failsafe_corner, is_extended_key,
+        format_count, ico_image_for_size, in_failsafe_corner, is_extended_key, is_newer_version,
         is_valid_burst_clicks, is_valid_burst_gap, is_valid_delay_minutes, is_valid_interval,
         is_valid_keybind, is_valid_limit, is_valid_limit_seconds, is_valid_offset,
         is_valid_pixel_tol, is_valid_press_ms, is_valid_ramp_seconds, is_valid_repeat_key,
         is_valid_scroll_amount, jittered_interval_ms, key_name, next_click_deadline,
-        other_monitor_centre, parse_cli_full, ramped_interval_ms, rect_is_fullscreen,
-        region_changed, sanitize_slot_name, CliCommand, CliOptions, ClickAction, ClickButton,
-        ClickMode, Config, ConfigChoice, Engine, KeyPressDetector, KeyReleaseDetector, TargetMode,
-        DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, USAGE, VK_ESCAPE_CODE,
+        other_monitor_centre, parse_cli_full, parse_latest_release, ramped_interval_ms,
+        rect_is_fullscreen, region_changed, sanitize_slot_name, CliCommand, CliOptions,
+        ClickAction, ClickButton, ClickMode, Config, ConfigChoice, Engine, KeyPressDetector,
+        KeyReleaseDetector, TargetMode, DEFAULT_PIXEL_TOL, LATEST_RELEASE_URL, MAX_INTERVAL_MS,
+        MIN_INTERVAL_MS, USAGE, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR, PWSTR};
@@ -130,6 +131,13 @@ mod win {
         SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HMONITOR,
         MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
+    use windows::Win32::Networking::WinHttp::{
+        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+        WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+        WinHttpSendRequest, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_QUERY_STATUS_CODE,
+    };
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -138,8 +146,8 @@ mod win {
         HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE,
     };
     use windows::Win32::System::Threading::{
-        CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        CreateMutexW, GetCurrentThread, OpenProcess, QueryFullProcessImageNameW, SetThreadPriority,
+        PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_PRIORITY_BELOW_NORMAL,
     };
     use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
     use windows::Win32::UI::HiDpi::{
@@ -154,8 +162,8 @@ mod win {
         MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-        NOTIFYICONDATAW,
+        ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+        NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -181,6 +189,9 @@ mod win {
     const WM_APP_GATE: u32 = WM_APP + 7;
     /// Posted after a capture assigns a key, to (re)register hotkeys.
     const WM_APP_REHOTKEY: u32 = WM_APP + 8;
+    /// Posted by the launch-time update check when a newer release
+    /// exists; the tag and release URL wait in `update_offer`.
+    const WM_APP_UPDATE: u32 = WM_APP + 9;
     /// The delayed-start countdown timer on the main window.
     const ID_DELAY_TIMER: usize = 2;
     /// RegisterHotKey ids (their own numbering space).
@@ -279,6 +290,9 @@ mod win {
     // App-picker window controls (0.9.0).
     const ID_AP_LIST: usize = 3001;
     const ID_AP_SELECT: usize = 3002;
+    // Update prompt window controls (1.0.0).
+    const ID_UP_DOWNLOAD: usize = 3101;
+    const ID_UP_LATER: usize = 3102;
 
     static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
     static KEYBIND_VK: AtomicU32 = AtomicU32::new(trayclick::DEFAULT_KEYBIND_VK);
@@ -384,6 +398,10 @@ mod win {
     static PENDING_PROFILE: OnceLock<Mutex<String>> = OnceLock::new();
     /// The app picker's process names, parallel to its listbox rows.
     static APP_PICK_EXES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    /// The update on offer, when the launch-time check found one:
+    /// (release tag, release page URL), written by the check thread
+    /// before it posts `WM_APP_UPDATE`, read by the prompt window.
+    static UPDATE_OFFER: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
     /// Auto-stop limit in clicks per run; 0 = no limit.
     static LIMIT_CLICKS: AtomicU32 = AtomicU32::new(0);
     /// Auto-stop limit in seconds per run; 0 = no limit (0.11.0).
@@ -424,6 +442,9 @@ mod win {
     /// `sync_hold_state` — so every stop path releases the button.
     static HELD: AtomicBool = AtomicBool::new(false);
     static MAIN_HWND: AtomicI32 = AtomicI32::new(0);
+    /// The update prompt window while it is open (0 = not open), so
+    /// the check can never stack a second one.
+    static UPDATE_HWND: AtomicI32 = AtomicI32::new(0);
     /// True while a dialog window (Set Keybind or Set Interval) is open;
     /// the polling thread must not treat keys pressed there as toggles.
     static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
@@ -634,6 +655,10 @@ mod win {
 
     fn pending_profile() -> &'static Mutex<String> {
         PENDING_PROFILE.get_or_init(|| Mutex::new(String::new()))
+    }
+
+    fn update_offer() -> &'static Mutex<Option<(String, String)>> {
+        UPDATE_OFFER.get_or_init(|| Mutex::new(None))
     }
 
     fn app_pick_exes() -> &'static Mutex<Vec<String>> {
@@ -5258,6 +5283,379 @@ mod win {
         }
     }
 
+    // ---------- update check (1.0.0) ----------
+
+    /// The launch-time update check, on its own thread so startup
+    /// never waits for the network. It runs at every launch — there
+    /// is deliberately no setting for it — and its only visible trace
+    /// is the prompt window when GitHub's latest release is newer
+    /// than this build. Every failure along the way (offline, DNS,
+    /// TLS, a non-200 reply, a body that does not parse) simply ends
+    /// the thread: no window, no retry, nothing written anywhere.
+    /// This check is the program's only network use.
+    fn update_check_thread() {
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+        let Some(body) = fetch_latest_release() else {
+            return;
+        };
+        let Some((tag, url)) = parse_latest_release(&body) else {
+            return;
+        };
+        if !is_newer_version(env!("CARGO_PKG_VERSION"), &tag) {
+            return;
+        }
+        *update_offer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((tag, url));
+        post_main(WM_APP_UPDATE);
+    }
+
+    /// GET the latest-release JSON from GitHub over WinHTTP, with the
+    /// user agent GitHub's API requires. `None` on any failure.
+    fn fetch_latest_release() -> Option<String> {
+        let (_, after_scheme) = LATEST_RELEASE_URL.split_once("://")?;
+        let (host, path) = after_scheme.split_once('/')?;
+        let agent = wide("TrayClick");
+        let host_w = wide(host);
+        let path_w = wide(&format!("/{path}"));
+        unsafe {
+            let session = WinHttpOpen(
+                PCWSTR(agent.as_ptr()),
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                0,
+            );
+            if session.is_null() {
+                return None;
+            }
+            // Resolve/connect/send/receive each get ~10 s; an
+            // unreachable network must not linger past that.
+            let _ = WinHttpSetTimeouts(session, 10_000, 10_000, 10_000, 10_000);
+            let connect = WinHttpConnect(
+                session,
+                PCWSTR(host_w.as_ptr()),
+                INTERNET_DEFAULT_HTTPS_PORT,
+                0,
+            );
+            if connect.is_null() {
+                let _ = WinHttpCloseHandle(session);
+                return None;
+            }
+            let request = WinHttpOpenRequest(
+                connect,
+                w!("GET"),
+                PCWSTR(path_w.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                std::ptr::null(),
+                WINHTTP_FLAG_SECURE,
+            );
+            if request.is_null() {
+                let _ = WinHttpCloseHandle(connect);
+                let _ = WinHttpCloseHandle(session);
+                return None;
+            }
+            let body = send_and_read_release(request);
+            let _ = WinHttpCloseHandle(request);
+            let _ = WinHttpCloseHandle(connect);
+            let _ = WinHttpCloseHandle(session);
+            body
+        }
+    }
+
+    /// Send the prepared request and read its body, requiring an
+    /// HTTP 200. Split out of `fetch_latest_release` so that function
+    /// only juggles handle lifetimes.
+    fn send_and_read_release(request: *mut c_void) -> Option<String> {
+        unsafe {
+            WinHttpSendRequest(request, None, None, 0, 0, 0).ok()?;
+            WinHttpReceiveResponse(request, std::ptr::null_mut()).ok()?;
+            // The status code is a pseudo-header: per the WinHTTP
+            // documentation it is queried with the name
+            // WINHTTP_HEADER_NAME_BY_INDEX and the index
+            // WINHTTP_NO_HEADER_INDEX — both are (pointer)-1
+            // sentinels the windows crate does not name.
+            let mut status: u32 = 0;
+            let mut len = std::mem::size_of::<u32>() as u32;
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                PCWSTR(usize::MAX as *const u16),
+                Some(&mut status as *mut u32 as *mut c_void),
+                &mut len,
+                usize::MAX as *mut u32,
+            )
+            .ok()?;
+            if status != 200 {
+                return None;
+            }
+            let mut bytes: Vec<u8> = Vec::new();
+            loop {
+                let mut available: u32 = 0;
+                WinHttpQueryDataAvailable(request, &mut available).ok()?;
+                if available == 0 {
+                    break;
+                }
+                // The release JSON is a few KB; anything past 1 MiB
+                // is not it, whatever answered.
+                if bytes.len() + available as usize > 1_048_576 {
+                    return None;
+                }
+                let mut chunk = vec![0u8; available as usize];
+                let mut read: u32 = 0;
+                WinHttpReadData(
+                    request,
+                    chunk.as_mut_ptr() as *mut c_void,
+                    available,
+                    &mut read,
+                )
+                .ok()?;
+                if read == 0 {
+                    break;
+                }
+                chunk.truncate(read as usize);
+                bytes.extend_from_slice(&chunk);
+            }
+            String::from_utf8(bytes).ok()
+        }
+    }
+
+    /// Owner-draw the prompt's Download button, matching the settings
+    /// window's Start button: red fill, brighter red border, white
+    /// text (see `draw_run_button`).
+    fn draw_download_button(dis: &DRAWITEMSTRUCT) {
+        unsafe {
+            let hdc = dis.hDC;
+            let rc = dis.rcItem;
+            FillRect(hdc, &rc, start_fill_brush());
+            FrameRect(hdc, &rc, accent_brush());
+            let mut buf = [0u16; 32];
+            let n = GetWindowTextW(dis.hwndItem, &mut buf);
+            if n > 0 {
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+                let mut text_rc = rc;
+                DrawTextW(
+                    hdc,
+                    &mut buf[..n as usize],
+                    &mut text_rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+        }
+    }
+
+    unsafe extern "system" fn update_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_COMMAND => {
+                match wparam.0 & 0xFFFF {
+                    ID_UP_DOWNLOAD => {
+                        // Open the release page in the browser; the
+                        // download and install stay the user's own
+                        // steps — nothing is fetched or run for them.
+                        let url = update_offer()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .as_ref()
+                            .map(|(_, url)| url.clone());
+                        if let Some(url) = url {
+                            let url_w = wide(&url);
+                            let _ = ShellExecuteW(
+                                Some(hwnd),
+                                w!("open"),
+                                PCWSTR(url_w.as_ptr()),
+                                PCWSTR::null(),
+                                PCWSTR::null(),
+                                SW_SHOWNORMAL,
+                            );
+                        }
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    // Later — and IDCANCEL (2), which the dialog
+                    // message loop sends for Esc — just closes.
+                    ID_UP_LATER | 2 => {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                // The settings window's charcoal theme.
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+                SetTextColor(hdc, COLORREF(0x00F2F2F2));
+                SetBkMode(hdc, TRANSPARENT);
+                LRESULT(settings_bg_brush().0 as isize)
+            }
+            WM_DRAWITEM => {
+                let dis = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                draw_download_button(dis);
+                LRESULT(1)
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                UPDATE_HWND.store(0, Ordering::SeqCst);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Open the update prompt, or raise it if it is somehow already
+    /// open. Called from the main window on `WM_APP_UPDATE`; styled
+    /// exactly like the settings window (charcoal background, dark
+    /// title bar, red accent on the primary button).
+    fn open_update_window(parent: HWND) {
+        let raw = UPDATE_HWND.load(Ordering::SeqCst);
+        if raw != 0 {
+            let existing = HWND(raw as isize as *mut c_void);
+            unsafe {
+                if IsWindow(Some(existing)).as_bool() {
+                    let _ = SetForegroundWindow(existing);
+                    return;
+                }
+            }
+        }
+        let Some((tag, _url)) = update_offer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        unsafe {
+            let instance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+            static REGISTERED: AtomicBool = AtomicBool::new(false);
+            if !REGISTERED.swap(true, Ordering::SeqCst) {
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(update_wndproc),
+                    hInstance: instance.into(),
+                    hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                    hbrBackground: CreateSolidBrush(COLORREF(0x001B_1B1B)),
+                    lpszClassName: w!("TrayClickUpdate"),
+                    ..Default::default()
+                };
+                RegisterClassW(&wc);
+            }
+            // Fixed layout in physical pixels, like the settings
+            // window (the process is per-monitor DPI aware, so no
+            // scaling helper exists to reuse), centred on the screen.
+            let width = 440;
+            let height = 172;
+            let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
+            let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+            let hwnd = match CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("TrayClickUpdate"),
+                w!("TrayClick — Update available"),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                x,
+                y,
+                width,
+                height,
+                Some(parent),
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            UPDATE_HWND.store(hwnd.0 as i32, Ordering::SeqCst);
+            // Dark title bar to match the charcoal client area.
+            let dark: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const i32 as *const c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            let label_style = WS_CHILD | WS_VISIBLE;
+            let btn_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+            // BS_OWNERDRAW (0xB) for the Download button.
+            let owner_style = btn_style | WINDOW_STYLE(0x0000_000B);
+            let version = tag.strip_prefix('v').unwrap_or(&tag);
+            let line1 = wide(&format!("TrayClick {version} is available."));
+            let _ = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR(line1.as_ptr()),
+                label_style,
+                20,
+                18,
+                384,
+                20,
+                Some(hwnd),
+                None,
+                Some(instance.into()),
+                None,
+            );
+            let line2 = wide(&format!(
+                "You have {}. Download it from the release page?",
+                env!("CARGO_PKG_VERSION")
+            ));
+            let _ = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR(line2.as_ptr()),
+                label_style,
+                20,
+                44,
+                384,
+                20,
+                Some(hwnd),
+                None,
+                Some(instance.into()),
+                None,
+            );
+            let _ = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                w!("Download"),
+                owner_style,
+                192,
+                84,
+                108,
+                32,
+                Some(hwnd),
+                Some(HMENU(ID_UP_DOWNLOAD as *mut c_void)),
+                Some(instance.into()),
+                None,
+            );
+            let later = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                w!("Later"),
+                btn_style,
+                308,
+                84,
+                108,
+                32,
+                Some(hwnd),
+                Some(HMENU(ID_UP_LATER as *mut c_void)),
+                Some(instance.into()),
+                None,
+            );
+            // Focus rests on Later, so a stray keypress while the
+            // prompt appears can only dismiss it, never open a page.
+            if let Ok(later) = later {
+                let _ = SetFocus(Some(later));
+            }
+        }
+    }
+
     // ---------- main (hidden) window ----------
 
     unsafe extern "system" fn wndproc(
@@ -5326,6 +5724,11 @@ mod win {
             }
             m if m == WM_APP_REHOTKEY => {
                 register_hotkeys(hwnd);
+                LRESULT(0)
+            }
+            m if m == WM_APP_UPDATE => {
+                // The launch-time check found a newer release.
+                open_update_window(hwnd);
                 LRESULT(0)
             }
             WM_HOTKEY => {
@@ -5828,6 +6231,12 @@ mod win {
                 TASKBAR_CREATED_MSG.store(taskbar_id, Ordering::SeqCst);
             }
             tray_add(hwnd);
+            // The launch-time update check (1.0.0): one background
+            // thread on the normal tray startup path only — launches
+            // that forwarded a command or ran a maintenance command
+            // have already returned above. It posts WM_APP_UPDATE
+            // only when a newer release exists.
+            std::thread::spawn(update_check_thread);
             refresh_indicator(hwnd);
             register_hotkeys(hwnd);
             if cli_start {
@@ -5842,6 +6251,15 @@ mod win {
                 if iv != 0 {
                     let iv_hwnd = HWND(iv as isize as *mut c_void);
                     if IsDialogMessageW(iv_hwnd, &msg).as_bool() {
+                        continue;
+                    }
+                }
+                // Same dialog behaviour for the update prompt while
+                // it is open (Tab between its buttons, Esc closes).
+                let up = UPDATE_HWND.load(Ordering::SeqCst);
+                if up != 0 {
+                    let up_hwnd = HWND(up as isize as *mut c_void);
+                    if IsDialogMessageW(up_hwnd, &msg).as_bool() {
                         continue;
                     }
                 }
