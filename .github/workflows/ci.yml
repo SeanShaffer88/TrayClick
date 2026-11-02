@@ -21,3 +21,22 @@ jobs:
         run: cargo test --locked
       - name: Build release
         run: cargo build --release --locked
+      - name: Verify MSI authoring compiles (WiX)
+        shell: pwsh
+        run: |
+          $candle = $null
+          $light = $null
+          if ($env:WIX) {
+            $c = Join-Path $env:WIX "bin\candle.exe"
+            $l = Join-Path $env:WIX "bin\light.exe"
+            if (Test-Path $c) { $candle = $c; $light = $l }
+          }
+          if (-not $candle) {
+            $candle = (Get-Command candle.exe -ErrorAction SilentlyContinue).Source
+            $light = (Get-Command light.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $candle) { throw "WiX candle.exe not found (neither `$env:WIX\bin nor PATH)" }
+          & $candle -ext WixUIExtension "-dAppVersion=0.0.0" installer/TrayClick.wxs -out "target/TrayClick.wixobj"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $light -ext WixUIExtension -b installer "target/TrayClick.wixobj" -out "target/TrayClick-ci-check.msi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
