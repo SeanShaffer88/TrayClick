@@ -2,8 +2,9 @@
 
 //! TrayClick — a Windows tray auto clicker.
 //!
-//! Lives entirely in the notification area. Left- or right-clicking the
-//! tray icon opens a menu with exactly six items:
+//! Lives entirely in the notification area. Right-clicking the
+//! tray icon opens a menu with exactly six items; left-clicking it
+//! opens the settings window (the Set Interval window below):
 //!
 //! - **Pause / Resume** — pause stops clicking and ignores the keybind
 //!   until resumed.
@@ -68,6 +69,14 @@
 //! local maintenance commands — `--help`, `--version`, `--clean`,
 //! and `--uninstall` — that run before any window exists.
 //!
+//! The 0.11.0 work adds a second auto-stop limit — elapsed seconds
+//! per run — beside the click limit (whichever is reached first
+//! stops the run, in Hold mode too), rearranges the settings
+//! window into a charcoal window with a fixed top control bar
+//! (keybind, interval, Start/Stop), grouped pages whose buttons
+//! sit in a footer row, and makes a left-click on the tray icon
+//! open the settings window (right-click keeps the menu).
+//!
 //! Pressing the keybind (default **F6**) toggles auto left-clicking at the
 //! cursor position at the configured interval (default 100 ms),
 //! indefinitely, until the keybind is pressed again. While clicking is
@@ -97,16 +106,16 @@ mod win {
     use std::time::{Duration, Instant};
 
     use trayclick::{
-        absolute_coord, choose_config_file, colour_matches, effective_button, format_count,
-        ico_image_for_size, in_failsafe_corner, is_extended_key, is_valid_burst_clicks,
-        is_valid_burst_gap, is_valid_delay_minutes, is_valid_interval, is_valid_keybind,
-        is_valid_limit, is_valid_offset, is_valid_pixel_tol, is_valid_press_ms,
-        is_valid_ramp_seconds, is_valid_repeat_key, is_valid_scroll_amount, jittered_interval_ms,
-        key_name, next_click_deadline, other_monitor_centre, parse_cli_full, ramped_interval_ms,
-        rect_is_fullscreen, region_changed, sanitize_slot_name, CliCommand, CliOptions,
-        ClickAction, ClickButton, ClickMode, Config, ConfigChoice, Engine, KeyPressDetector,
-        KeyReleaseDetector, TargetMode, DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, USAGE,
-        VK_ESCAPE_CODE,
+        absolute_coord, auto_stop_reached, choose_config_file, colour_matches, effective_button,
+        format_count, ico_image_for_size, in_failsafe_corner, is_extended_key,
+        is_valid_burst_clicks, is_valid_burst_gap, is_valid_delay_minutes, is_valid_interval,
+        is_valid_keybind, is_valid_limit, is_valid_limit_seconds, is_valid_offset,
+        is_valid_pixel_tol, is_valid_press_ms, is_valid_ramp_seconds, is_valid_repeat_key,
+        is_valid_scroll_amount, jittered_interval_ms, key_name, next_click_deadline,
+        other_monitor_centre, parse_cli_full, ramped_interval_ms, rect_is_fullscreen,
+        region_changed, sanitize_slot_name, CliCommand, CliOptions, ClickAction, ClickButton,
+        ClickMode, Config, ConfigChoice, Engine, KeyPressDetector, KeyReleaseDetector, TargetMode,
+        DEFAULT_PIXEL_TOL, MAX_INTERVAL_MS, MIN_INTERVAL_MS, USAGE, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR, PWSTR};
@@ -114,10 +123,12 @@ mod win {
         CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LPARAM,
         LRESULT, POINT, RECT, WPARAM,
     };
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
     use windows::Win32::Graphics::Gdi::{
-        CreateSolidBrush, EnumDisplayMonitors, GetDC, GetMonitorInfoW, GetPixel, MonitorFromWindow,
-        ReleaseDC, SetBkMode, SetTextColor, HBRUSH, HDC, HMONITOR, MONITORINFO,
-        MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+        CreateSolidBrush, DrawTextW, EnumDisplayMonitors, FillRect, FrameRect, GetDC,
+        GetMonitorInfoW, GetPixel, InvalidateRect, MonitorFromWindow, ReleaseDC, SetBkColor,
+        SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HMONITOR,
+        MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -130,6 +141,7 @@ mod win {
         CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
@@ -257,6 +269,13 @@ mod win {
     const ID_IV_FG: usize = 2135;
     const ID_IV_FG_LABEL: usize = 2136;
     const ID_IV_FG_PICK: usize = 2137;
+    // Auto-stop seconds row and the top control bar (0.11.0).
+    const ID_IV_LIMIT_SEC_EDIT: usize = 2138;
+    const ID_IV_LIMIT_SEC_SET: usize = 2139;
+    const ID_IV_TOP_KEYNAME: usize = 2140;
+    const ID_IV_TOP_KEYBIND: usize = 2141;
+    const ID_IV_TOP_START: usize = 2142;
+    const ID_IV_TOP_STOP: usize = 2143;
     // App-picker window controls (0.9.0).
     const ID_AP_LIST: usize = 3001;
     const ID_AP_SELECT: usize = 3002;
@@ -367,6 +386,8 @@ mod win {
     static APP_PICK_EXES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     /// Auto-stop limit in clicks per run; 0 = no limit.
     static LIMIT_CLICKS: AtomicU32 = AtomicU32::new(0);
+    /// Auto-stop limit in seconds per run; 0 = no limit (0.11.0).
+    static LIMIT_SECONDS: AtomicU32 = AtomicU32::new(0);
     /// Clicks sent in the current run (reset on every activation).
     static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
     /// Whether clicking starts when TrayClick launches (click mode).
@@ -640,6 +661,7 @@ mod win {
             mode: current_mode(),
             lock_position: target_mode() != TargetMode::Follow,
             limit_clicks: LIMIT_CLICKS.load(Ordering::SeqCst),
+            limit_seconds: LIMIT_SECONDS.load(Ordering::SeqCst),
             start_on_launch: START_ON_LAUNCH.load(Ordering::SeqCst),
             action: current_action(),
             burst_clicks: BURST_CLICKS.load(Ordering::SeqCst),
@@ -1185,16 +1207,25 @@ mod win {
                 RUN_COUNT.load(Ordering::Relaxed),
             );
             click_once(btn, point);
-            if limit_reached() {
+            // Elapsed is not tracked inside a cycle; pass 0 so this
+            // mid-burst check is the click limit only. The clicker
+            // loop checks both limits after every cycle.
+            if limit_reached(0) {
                 return;
             }
         }
     }
 
-    /// Whether the current run has reached the auto-stop limit.
-    fn limit_reached() -> bool {
-        let limit = LIMIT_CLICKS.load(Ordering::SeqCst);
-        limit > 0 && RUN_COUNT.load(Ordering::Relaxed) >= limit as u64
+    /// Whether the current run has reached an auto-stop limit:
+    /// the click limit or the elapsed-seconds limit, whichever is
+    /// reached first (a limit of 0 is off).
+    fn limit_reached(elapsed_s: u64) -> bool {
+        auto_stop_reached(
+            RUN_COUNT.load(Ordering::Relaxed),
+            LIMIT_CLICKS.load(Ordering::SeqCst),
+            elapsed_s,
+            LIMIT_SECONDS.load(Ordering::SeqCst),
+        )
     }
 
     /// Post a message to the main window (used by the worker threads).
@@ -1619,12 +1650,25 @@ mod win {
             }
             if current_mode() == ClickMode::Hold && current_action().is_click_action() {
                 // Nothing to schedule — the button is simply down. Just
-                // keep watch for the failsafe.
+                // keep watch for the failsafe, and for the auto-stop
+                // time limit: the hold's start is tracked so an elapsed
+                // limit can end the hold like any other run (the stop
+                // funnels through refresh_indicator, which releases the
+                // held button). The click limit cannot advance here —
+                // a hold performs no clicks.
                 if cursor_in_failsafe() {
                     trip_failsafe();
                 }
                 deadline = None;
-                run_start = None;
+                if run_start.is_none() {
+                    run_start = Some(Instant::now());
+                }
+                let elapsed = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                if limit_reached(elapsed) {
+                    lock_engine().clicking = false;
+                    post_main(WM_APP_LIMIT);
+                    run_start = None;
+                }
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -1658,7 +1702,8 @@ mod win {
                     }
                 }
             }
-            if limit_reached() {
+            let elapsed = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            if limit_reached(elapsed) {
                 lock_engine().clicking = false;
                 post_main(WM_APP_LIMIT);
                 deadline = None;
@@ -1935,6 +1980,25 @@ mod win {
 
     // ---------- tray menu ----------
 
+    /// Left-click on the tray icon: open the settings window by the
+    /// same path as the menu's Set Interval item. If the settings
+    /// window is already open, bring it to the foreground instead of
+    /// opening a second one (the open path itself no-ops while any
+    /// dialog is up).
+    fn open_settings_from_tray(hwnd: HWND) {
+        let raw = INTERVAL_HWND.load(Ordering::SeqCst);
+        if raw != 0 {
+            let existing = HWND(raw as isize as *mut c_void);
+            unsafe {
+                if IsWindow(Some(existing)).as_bool() {
+                    let _ = SetForegroundWindow(existing);
+                    return;
+                }
+            }
+        }
+        open_interval_window(hwnd);
+    }
+
     fn show_menu(hwnd: HWND) {
         unsafe {
             let menu = match CreatePopupMenu() {
@@ -2065,6 +2129,41 @@ mod win {
         let raw =
             *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(0x00181818)).0 } as isize);
         HBRUSH(raw as *mut c_void)
+    }
+
+    /// A process-lifetime solid brush from the settings window's
+    /// charcoal/red palette, created once per colour. Like
+    /// `dialog_bg_brush`, a brush handed to a `WM_CTLCOLOR*` handler
+    /// stays the app's responsibility, so it is never created per
+    /// repaint.
+    fn palette_brush(slot: &'static OnceLock<isize>, rgb: u32) -> HBRUSH {
+        let raw = *slot.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(rgb)).0 } as isize);
+        HBRUSH(raw as *mut c_void)
+    }
+
+    /// The settings window's charcoal background (#1B1B1B).
+    fn settings_bg_brush() -> HBRUSH {
+        static BRUSH: OnceLock<isize> = OnceLock::new();
+        palette_brush(&BRUSH, 0x001B_1B1B)
+    }
+
+    /// Edit background in the settings window (#262626).
+    fn edit_bg_brush() -> HBRUSH {
+        static BRUSH: OnceLock<isize> = OnceLock::new();
+        palette_brush(&BRUSH, 0x0026_2626)
+    }
+
+    /// The top bar Start button's red fill (#8F1113).
+    fn start_fill_brush() -> HBRUSH {
+        static BRUSH: OnceLock<isize> = OnceLock::new();
+        palette_brush(&BRUSH, 0x0013_118F)
+    }
+
+    /// The red accent (#E5484D): the Start/Stop borders and the
+    /// Stop button's caption.
+    fn accent_brush() -> HBRUSH {
+        static BRUSH: OnceLock<isize> = OnceLock::new();
+        palette_brush(&BRUSH, 0x004D_48E5)
     }
 
     // ---------- Set Keybind capture window ----------
@@ -2733,6 +2832,28 @@ mod win {
                     ID_IV_MODE => apply_mode(hwnd),
                     ID_IV_POS => apply_pos(hwnd),
                     ID_IV_LIMIT_SET => apply_limit(hwnd),
+                    ID_IV_LIMIT_SEC_SET => apply_limit_seconds(hwnd),
+                    ID_IV_TOP_KEYBIND => {
+                        // Mirror the repeat-key capture: close this
+                        // window first, then open the keybind capture
+                        // from the main window.
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        let _ = DestroyWindow(hwnd);
+                        open_capture(parent, 0);
+                    }
+                    ID_IV_TOP_START => {
+                        // Start the run and close: a run started under
+                        // an open dialog would click the dialog itself.
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        engine_start(parent);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    ID_IV_TOP_STOP => {
+                        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                        engine_stop(parent);
+                        relabel_interval_controls(hwnd);
+                        let _ = unsafe { SetFocus(Some(hwnd)) };
+                    }
                     ID_IV_LAUNCH => apply_launch(hwnd),
                     ID_IV_STOPKEY => apply_stopkey(hwnd),
                     ID_IV_HOTKEY => apply_hotkey(hwnd),
@@ -2795,11 +2916,25 @@ mod win {
                 }
                 LRESULT(0)
             }
-            WM_CTLCOLORSTATIC => {
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                // Charcoal theme: light text on the window's charcoal
+                // background. Push buttons ignore the colours, but
+                // group boxes take their caption and frame from them.
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
                 SetTextColor(hdc, COLORREF(0x00F2F2F2));
                 SetBkMode(hdc, TRANSPARENT);
-                LRESULT(dialog_bg_brush().0 as isize)
+                LRESULT(settings_bg_brush().0 as isize)
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+                SetTextColor(hdc, COLORREF(0x00F2F2F2));
+                SetBkColor(hdc, COLORREF(0x00262626));
+                LRESULT(edit_bg_brush().0 as isize)
+            }
+            WM_DRAWITEM => {
+                let dis = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                draw_run_button(dis);
+                LRESULT(1)
             }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
@@ -2850,6 +2985,15 @@ mod win {
             "Hotkeys: On".to_string()
         } else {
             "Hotkeys: Off".to_string()
+        }
+    }
+
+    /// The top bar's Start button caption: ticked while a run is on.
+    fn top_start_caption() -> String {
+        if lock_engine().is_clicking_now() {
+            "Start ✓".to_string()
+        } else {
+            "Start".to_string()
         }
     }
 
@@ -2946,13 +3090,16 @@ mod win {
         }
     }
 
+    /// The settings window's outer width on every page.
+    const SETTINGS_WIDTH: i32 = 440;
+
     /// The settings window's outer height for a page (Clicking
     /// carries the trigger controls, Targeting the targeting rows).
     fn page_outer_height(page: u32) -> i32 {
         match page {
-            0 => 560,
-            2 => 580,
-            _ => 420,
+            0 => 690,
+            2 => 610,
+            _ => 428,
         }
     }
 
@@ -3120,6 +3267,18 @@ mod win {
                     let t = wide(&page_caption(page));
                     let _ = SetWindowTextW(pb, PCWSTR(t.as_ptr()));
                 }
+            }
+            if let Ok(kn) = GetDlgItem(Some(hwnd), ID_IV_TOP_KEYNAME as i32) {
+                let t = wide(&key_name(KEYBIND_VK.load(Ordering::SeqCst)));
+                let _ = SetWindowTextW(kn, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(sb) = GetDlgItem(Some(hwnd), ID_IV_TOP_START as i32) {
+                let t = wide(&top_start_caption());
+                let _ = SetWindowTextW(sb, PCWSTR(t.as_ptr()));
+                let _ = InvalidateRect(Some(sb), None, true);
+            }
+            if let Ok(sb) = GetDlgItem(Some(hwnd), ID_IV_TOP_STOP as i32) {
+                let _ = InvalidateRect(Some(sb), None, true);
             }
             if let Ok(pb) = GetDlgItem(Some(hwnd), ID_IV_PICK_LOCK as i32) {
                 let t = wide(&pick_caption());
@@ -3499,6 +3658,80 @@ mod win {
         }
     }
 
+    /// Set the auto-stop time limit from the edit control (0 = no
+    /// limit). Mirrors `apply_limit`: applies at once and keeps the
+    /// window open; only a bad value interrupts, with a warning.
+    fn apply_limit_seconds(hwnd: HWND) {
+        let mut ok = false;
+        if let Ok(edit) = unsafe { GetDlgItem(Some(hwnd), ID_IV_LIMIT_SEC_EDIT as i32) } {
+            let mut buf = [0u16; 16];
+            let n = unsafe { GetWindowTextW(edit, &mut buf) };
+            if n > 0 {
+                let text = String::from_utf16_lossy(&buf[..n as usize]);
+                if let Ok(v) = text.trim().parse::<u32>() {
+                    if is_valid_limit_seconds(v) {
+                        LIMIT_SECONDS.store(v, Ordering::SeqCst);
+                        save_config(current_config());
+                        ok = true;
+                    }
+                }
+            }
+        }
+        if ok {
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+        } else {
+            let text = wide("Enter a whole number of seconds from 0 (no limit) to 604800.");
+            let title = wide("TrayClick — Set Interval");
+            unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+        }
+    }
+
+    /// Owner-draw the top bar's Start/Stop buttons: Start is a red
+    /// fill with a brighter red border and white text; Stop is the
+    /// charcoal background with a red border and red text.
+    fn draw_run_button(dis: &DRAWITEMSTRUCT) {
+        let start = dis.CtlID as usize == ID_IV_TOP_START;
+        unsafe {
+            let hdc = dis.hDC;
+            let rc = dis.rcItem;
+            if start {
+                FillRect(hdc, &rc, start_fill_brush());
+            } else {
+                FillRect(hdc, &rc, settings_bg_brush());
+            }
+            FrameRect(hdc, &rc, accent_brush());
+            let mut buf = [0u16; 32];
+            let n = GetWindowTextW(dis.hwndItem, &mut buf);
+            if n > 0 {
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(
+                    hdc,
+                    if start {
+                        COLORREF(0x00FF_FFFF)
+                    } else {
+                        COLORREF(0x004D_48E5)
+                    },
+                );
+                let mut text_rc = rc;
+                DrawTextW(
+                    hdc,
+                    &mut buf[..n as usize],
+                    &mut text_rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+        }
+    }
+
     /// Read a free-text edit control (slot names allow letters and
     /// spaces, so the numeric readers do not apply).
     fn read_edit_text(hwnd: HWND, id: usize) -> String {
@@ -3678,9 +3911,10 @@ mod win {
     }
 
     /// Show one settings page: hide the other pages' controls, size
-    /// the window for the page, and park the footer at the bottom.
-    /// The window remembers its page across opens (item 49, partial —
-    /// remembering the window position itself lands in slice 7).
+    /// the window for the page, and park the footer text and the
+    /// page buttons at the bottom. The window remembers its page
+    /// across opens (item 49, partial — remembering the window
+    /// position itself lands in slice 7).
     fn show_page(hwnd: HWND, page: u32) {
         CURRENT_PAGE.store(page, Ordering::SeqCst);
         unsafe {
@@ -3689,7 +3923,7 @@ mod win {
                 None,
                 0,
                 0,
-                396,
+                SETTINGS_WIDTH,
                 page_outer_height(page),
                 SWP_NOMOVE | SWP_NOZORDER,
             );
@@ -3702,10 +3936,21 @@ mod win {
                     let _ = ShowWindow(h, if *p == page { SW_SHOW } else { SW_HIDE });
                 }
             }
-            if let Ok(footer) = GetDlgItem(Some(hwnd), ID_IV_FOOTER as i32) {
-                let mut rc = RECT::default();
-                if GetClientRect(hwnd, &mut rc).is_ok() {
-                    let _ = SetWindowPos(footer, None, 16, rc.bottom - 48, 348, 36, SWP_NOZORDER);
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() {
+                if let Ok(footer) = GetDlgItem(Some(hwnd), ID_IV_FOOTER as i32) {
+                    let _ = SetWindowPos(footer, None, 16, rc.bottom - 70, 392, 28, SWP_NOZORDER);
+                }
+                // The page buttons form a footer row (0.11.0; they
+                // were tabs at the top before).
+                for (id, x, w) in [
+                    (ID_IV_PAGE_CLICK, 16, 120),
+                    (ID_IV_PAGE_ACTION, 142, 120),
+                    (ID_IV_PAGE_TARGET, 268, 140),
+                ] {
+                    if let Ok(btn) = GetDlgItem(Some(hwnd), id as i32) {
+                        let _ = SetWindowPos(btn, None, x, rc.bottom - 34, w, 26, SWP_NOZORDER);
+                    }
                 }
             }
         }
@@ -3937,13 +4182,13 @@ mod win {
                     lpfnWndProc: Some(interval_wndproc),
                     hInstance: instance.into(),
                     hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-                    hbrBackground: CreateSolidBrush(COLORREF(0x00181818)),
+                    hbrBackground: CreateSolidBrush(COLORREF(0x001B_1B1B)),
                     lpszClassName: w!("TrayClickInterval"),
                     ..Default::default()
                 };
                 RegisterClassW(&wc);
             }
-            let width = 396;
+            let width = SETTINGS_WIDTH;
             let height = page_outer_height(CURRENT_PAGE.load(Ordering::SeqCst));
             let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
             let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
@@ -3968,6 +4213,15 @@ mod win {
                 }
             };
             INTERVAL_HWND.store(hwnd.0 as i32, Ordering::SeqCst);
+            // Dark title bar to match the charcoal client area
+            // (Windows 10 1903+; ignored where unsupported).
+            let dark: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const i32 as *const c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
 
             page_controls()
                 .lock()
@@ -4032,7 +4286,65 @@ mod win {
             // BS_DEFPUSHBUTTON (0x1) so Enter applies via the dialog loop.
             let apply_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000_0001);
 
-            // Page tabs (always visible).
+            // BS_GROUPBOX (0x7) for the page group frames, and
+            // BS_OWNERDRAW (0xB) for the top bar's Start/Stop buttons.
+            let group_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000_0007);
+            let owner_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000_000B);
+
+            // Top control bar (always visible, 0.11.0): the keybind
+            // and its Change button, the interval edit (moved up from
+            // page 0; Apply and the presets stay on that page), and
+            // the owner-drawn Start/Stop run buttons.
+            let _ = child(w!("STATIC"), "Hotkey", label_style, 16, 13, 40, 20, 0);
+            let keyname_now = key_name(KEYBIND_VK.load(Ordering::SeqCst)).to_string();
+            let _ = child(
+                w!("STATIC"),
+                &keyname_now,
+                label_style,
+                58,
+                13,
+                34,
+                20,
+                ID_IV_TOP_KEYNAME,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                "Change",
+                btn_style,
+                96,
+                8,
+                58,
+                28,
+                ID_IV_TOP_KEYBIND,
+            );
+            let _ = child(w!("STATIC"), "Interval", label_style, 160, 13, 44, 20, 0);
+            let current = INTERVAL_MS.load(Ordering::SeqCst).to_string();
+            let _ = child(w!("EDIT"), &current, edit_style, 206, 8, 50, 28, ID_IV_EDIT);
+            let _ = child(w!("STATIC"), "ms", label_style, 260, 13, 18, 20, 0);
+            let _ = child(
+                w!("BUTTON"),
+                &top_start_caption(),
+                owner_style,
+                284,
+                8,
+                58,
+                28,
+                ID_IV_TOP_START,
+            );
+            let _ = child(
+                w!("BUTTON"),
+                "Stop",
+                owner_style,
+                348,
+                8,
+                58,
+                28,
+                ID_IV_TOP_STOP,
+            );
+
+            // Page buttons (always visible). They live in a footer
+            // row now; `show_page` parks them at the window's bottom,
+            // so these coordinates are only a starting point.
             let _ = child(
                 w!("BUTTON"),
                 &page_caption(0),
@@ -4065,163 +4377,28 @@ mod win {
             );
 
             // ----- Page 0: Clicking -----
+            // Group: Auto-stop — the click limit and (0.11.0) the
+            // elapsed-seconds limit; whichever is reached first
+            // stops the run.
             let _ = child_p(
                 0,
-                w!("STATIC"),
-                "Interval between clicks (milliseconds):",
-                label_style,
+                w!("BUTTON"),
+                "Auto-stop",
+                group_style,
                 16,
-                48,
-                360,
-                20,
+                46,
+                392,
+                96,
                 0,
-            );
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                "1 ms",
-                btn_style,
-                16,
-                78,
-                80,
-                30,
-                ID_IV_1MS,
-            );
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                "100 ms",
-                btn_style,
-                106,
-                78,
-                80,
-                30,
-                ID_IV_100MS,
-            );
-            let current = INTERVAL_MS.load(Ordering::SeqCst).to_string();
-            let _ = child_p(
-                0,
-                w!("EDIT"),
-                &current,
-                edit_style,
-                200,
-                78,
-                76,
-                30,
-                ID_IV_EDIT,
-            );
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                "Apply",
-                apply_style,
-                290,
-                78,
-                74,
-                30,
-                ID_IV_APPLY,
-            );
-            let _ = child_p(
-                0,
-                w!("STATIC"),
-                "Mouse button:",
-                label_style,
-                16,
-                122,
-                360,
-                20,
-                0,
-            );
-            let cur_btn = current_button();
-            let left_cap = button_caption(ClickButton::Left, cur_btn);
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                &left_cap,
-                btn_style,
-                16,
-                146,
-                80,
-                30,
-                ID_IV_BTN_LEFT,
-            );
-            let right_cap = button_caption(ClickButton::Right, cur_btn);
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                &right_cap,
-                btn_style,
-                106,
-                146,
-                80,
-                30,
-                ID_IV_BTN_RIGHT,
-            );
-            let middle_cap = button_caption(ClickButton::Middle, cur_btn);
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                &middle_cap,
-                btn_style,
-                196,
-                146,
-                80,
-                30,
-                ID_IV_BTN_MIDDLE,
-            );
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                jitter_caption(),
-                btn_style,
-                290,
-                146,
-                74,
-                30,
-                ID_IV_JITTER,
-            );
-            let _ = child_p(
-                0,
-                w!("STATIC"),
-                "Mode and target:",
-                label_style,
-                16,
-                190,
-                360,
-                20,
-                0,
-            );
-            let mode_cap = mode_caption();
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                &mode_cap,
-                btn_style,
-                16,
-                214,
-                150,
-                30,
-                ID_IV_MODE,
-            );
-            let _ = child_p(
-                0,
-                w!("BUTTON"),
-                &pos_caption(),
-                btn_style,
-                176,
-                214,
-                188,
-                30,
-                ID_IV_POS,
             );
             let _ = child_p(
                 0,
                 w!("STATIC"),
                 "Stop after (clicks, 0 = no limit):",
                 label_style,
-                16,
-                258,
-                216,
+                32,
+                73,
+                200,
                 20,
                 0,
             );
@@ -4232,7 +4409,7 @@ mod win {
                 &limit_now,
                 edit_style,
                 238,
-                252,
+                67,
                 62,
                 30,
                 ID_IV_LIMIT_EDIT,
@@ -4243,20 +4420,182 @@ mod win {
                 "Set",
                 btn_style,
                 308,
-                252,
+                67,
                 56,
                 30,
                 ID_IV_LIMIT_SET,
             );
             let _ = child_p(
                 0,
+                w!("STATIC"),
+                "Stop after (seconds, 0 = no limit):",
+                label_style,
+                32,
+                109,
+                200,
+                20,
+                0,
+            );
+            let limit_sec_now = LIMIT_SECONDS.load(Ordering::SeqCst).to_string();
+            let _ = child_p(
+                0,
+                w!("EDIT"),
+                &limit_sec_now,
+                edit_style,
+                238,
+                103,
+                62,
+                30,
+                ID_IV_LIMIT_SEC_EDIT,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "Set",
+                btn_style,
+                308,
+                103,
+                56,
+                30,
+                ID_IV_LIMIT_SEC_SET,
+            );
+
+            // Group: Click options.
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "Click options",
+                group_style,
+                16,
+                152,
+                392,
+                346,
+                0,
+            );
+            let _ = child_p(
+                0,
+                w!("STATIC"),
+                "Interval presets:",
+                label_style,
+                32,
+                176,
+                180,
+                18,
+                0,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "1 ms",
+                btn_style,
+                32,
+                196,
+                80,
+                28,
+                ID_IV_1MS,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "100 ms",
+                btn_style,
+                120,
+                196,
+                80,
+                28,
+                ID_IV_100MS,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "Apply",
+                apply_style,
+                208,
+                196,
+                96,
+                28,
+                ID_IV_APPLY,
+            );
+            let _ = child_p(
+                0,
+                w!("STATIC"),
+                "Mouse button:",
+                label_style,
+                32,
+                232,
+                200,
+                18,
+                0,
+            );
+            let cur_btn = current_button();
+            let left_cap = button_caption(ClickButton::Left, cur_btn);
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &left_cap,
+                btn_style,
+                32,
+                252,
+                80,
+                28,
+                ID_IV_BTN_LEFT,
+            );
+            let right_cap = button_caption(ClickButton::Right, cur_btn);
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &right_cap,
+                btn_style,
+                120,
+                252,
+                80,
+                28,
+                ID_IV_BTN_RIGHT,
+            );
+            let middle_cap = button_caption(ClickButton::Middle, cur_btn);
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &middle_cap,
+                btn_style,
+                208,
+                252,
+                80,
+                28,
+                ID_IV_BTN_MIDDLE,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                jitter_caption(),
+                btn_style,
+                296,
+                252,
+                96,
+                28,
+                ID_IV_JITTER,
+            );
+            let mode_cap = mode_caption();
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &mode_cap,
+                btn_style,
+                32,
+                288,
+                360,
+                28,
+                ID_IV_MODE,
+            );
+            let _ = child_p(
+                0,
                 w!("BUTTON"),
                 launch_caption(),
                 btn_style,
-                16,
-                290,
-                348,
-                30,
+                32,
+                322,
+                360,
+                28,
                 ID_IV_LAUNCH,
             );
             let sk_cap = stopkey_caption();
@@ -4265,10 +4604,10 @@ mod win {
                 w!("BUTTON"),
                 &sk_cap,
                 btn_style,
-                16,
-                328,
+                32,
+                356,
                 176,
-                30,
+                28,
                 ID_IV_STOPKEY,
             );
             let hk_cap = hotkey_caption();
@@ -4277,10 +4616,10 @@ mod win {
                 w!("BUTTON"),
                 &hk_cap,
                 btn_style,
-                196,
-                328,
-                168,
-                30,
+                216,
+                356,
+                176,
+                28,
                 ID_IV_HOTKEY,
             );
             let _ = child_p(
@@ -4288,10 +4627,10 @@ mod win {
                 w!("STATIC"),
                 "Start in (min):",
                 label_style,
-                16,
-                372,
-                110,
-                20,
+                32,
+                396,
+                104,
+                18,
                 0,
             );
             let _ = child_p(
@@ -4299,10 +4638,10 @@ mod win {
                 w!("EDIT"),
                 "10",
                 edit_signed_style,
-                130,
-                366,
+                140,
+                390,
                 52,
-                30,
+                28,
                 ID_IV_DELAY_EDIT,
             );
             let dl_cap = delay_caption();
@@ -4311,10 +4650,10 @@ mod win {
                 w!("BUTTON"),
                 &dl_cap,
                 btn_style,
-                190,
-                366,
-                174,
-                30,
+                200,
+                390,
+                192,
+                28,
                 ID_IV_DELAY,
             );
             let fs_cap = fs_caption();
@@ -4323,10 +4662,10 @@ mod win {
                 w!("BUTTON"),
                 &fs_cap,
                 btn_style,
-                16,
-                404,
+                32,
+                424,
                 176,
-                30,
+                28,
                 ID_IV_FS,
             );
             let fg_cap = fg_caption();
@@ -4335,10 +4674,10 @@ mod win {
                 w!("BUTTON"),
                 &fg_cap,
                 btn_style,
-                196,
-                404,
-                168,
-                30,
+                216,
+                424,
+                176,
+                28,
                 ID_IV_FG,
             );
             let _ = child_p(
@@ -4346,10 +4685,10 @@ mod win {
                 w!("BUTTON"),
                 "Pick app...",
                 btn_style,
-                16,
-                442,
+                32,
+                458,
                 140,
-                30,
+                28,
                 ID_IV_FG_PICK,
             );
             let fgl_cap = fg_label_caption();
@@ -4358,13 +4697,36 @@ mod win {
                 w!("STATIC"),
                 &fgl_cap,
                 label_style,
-                168,
-                448,
-                196,
-                20,
+                180,
+                463,
+                212,
+                18,
                 ID_IV_FG_LABEL,
             );
 
+            // Group: Cursor position.
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                "Cursor position",
+                group_style,
+                16,
+                508,
+                392,
+                62,
+                0,
+            );
+            let _ = child_p(
+                0,
+                w!("BUTTON"),
+                &pos_caption(),
+                btn_style,
+                32,
+                528,
+                360,
+                28,
+                ID_IV_POS,
+            );
             // ----- Page 1: Action -----
             let _ = child_p(
                 1,
@@ -4879,15 +5241,16 @@ mod win {
                 ID_IV_TOL_SET,
             );
 
-            // Footer (always visible; show_page parks it at the bottom).
+            // Footer (always visible; show_page parks it and the
+            // page buttons at the bottom).
             let _ = child(
                 w!("STATIC"),
-                "Tabs group the settings. Presets and toggles apply at once; numbers apply with their Set buttons. Esc closes.",
+                "Pages group the settings. Presets and toggles apply at once; numbers apply with their Set buttons. Esc closes.",
                 label_style,
                 16,
                 380,
-                348,
-                36,
+                392,
+                28,
                 ID_IV_FOOTER,
             );
             show_page(hwnd, CURRENT_PAGE.load(Ordering::SeqCst));
@@ -4928,9 +5291,13 @@ mod win {
                 LRESULT(0)
             }
             WM_TRAYICON => {
+                // Left-click opens the settings window; right-click
+                // opens the menu (0.11.0 — before, both opened it).
                 let event = lparam.0 as u32;
-                if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
+                if event == WM_RBUTTONUP {
                     show_menu(hwnd);
+                } else if event == WM_LBUTTONUP {
+                    open_settings_from_tray(hwnd);
                 }
                 LRESULT(0)
             }
@@ -5400,6 +5767,7 @@ mod win {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = cfg.fg_exe.clone();
         FS_PAUSE.store(cfg.fs_pause, Ordering::SeqCst);
         LIMIT_CLICKS.store(cfg.limit_clicks, Ordering::SeqCst);
+        LIMIT_SECONDS.store(cfg.limit_seconds, Ordering::SeqCst);
         START_ON_LAUNCH.store(cfg.start_on_launch, Ordering::SeqCst);
         ACTION.store(action_u32(cfg.action), Ordering::SeqCst);
         BURST_CLICKS.store(cfg.burst_clicks, Ordering::SeqCst);

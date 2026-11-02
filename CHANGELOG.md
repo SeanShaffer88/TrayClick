@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.0 — 2026-11-02
+
+- **Auto-stop time limit.** Beside the existing "stop after N clicks" limit, the Clicking page now has "Stop after (seconds, 0 = no limit)": a run stops once it has been going for that many seconds (up to 604800 — seven days). With both limits set, whichever is reached first stops the run. It applies in Hold mode too — the held button is released when the time runs out. The setting is saved as `limit_seconds` in config.json; config files from earlier versions load unchanged (no time limit set).
+- **Settings window redesigned.** The settings window is now charcoal with red accents and a dark title bar. A fixed top bar carries the hotkey with a Change button, the interval box, and Start/Stop buttons. The Clicking page groups its controls (Auto-stop, Click options, Cursor position), the page buttons (Clicking / Action / Targeting) sit in a footer row, and the edit boxes are dark to match. Every control works as before; only the arrangement and colours changed.
+- **Tray icon.** Left-clicking the tray icon now opens Settings; right-click opens the menu.
+
 ## 0.10.0 — 2026-11-01
 
 A conformance release: no clicking changes, but where settings live, what the command line can do, and how releases are packaged all changed.

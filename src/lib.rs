@@ -251,6 +251,28 @@ pub fn is_valid_limit(n: u32) -> bool {
     n <= MAX_LIMIT_CLICKS
 }
 
+/// The largest auto-stop time limit (in seconds) the config accepts:
+/// seven days.
+pub const MAX_LIMIT_SECONDS: u32 = 604_800;
+
+/// Whether an auto-stop time limit is acceptable: 0 means "no limit".
+pub fn is_valid_limit_seconds(n: u32) -> bool {
+    n <= MAX_LIMIT_SECONDS
+}
+
+/// Whether a run has reached an auto-stop limit. A limit of 0 is off
+/// and never fires; with both limits set, whichever is reached first
+/// stops the run.
+pub fn auto_stop_reached(
+    clicks_done: u64,
+    limit_clicks: u32,
+    elapsed_s: u64,
+    limit_seconds: u32,
+) -> bool {
+    (limit_clicks > 0 && clicks_done >= u64::from(limit_clicks))
+        || (limit_seconds > 0 && elapsed_s >= u64::from(limit_seconds))
+}
+
 /// Where cycles land: follow the cursor, one locked point, or a
 /// rotating sequence of points. (Slice 3 of the 50-enhancement
 /// program; replaces the pre-0.8 `lock_position` boolean, which the
@@ -940,8 +962,9 @@ pub fn choose_config_file(
 /// Persisted settings: the keybind, the click interval, which mouse
 /// button is clicked, whether interval jitter is on, the mode (click
 /// or hold), whether clicks lock to the position where clicking
-/// started, the auto-stop limit in clicks (0 = no limit), and whether
-/// clicking starts when TrayClick launches (click mode only).
+/// started, the auto-stop limits in clicks and in seconds (0 = no
+/// limit; the first one reached stops the run), and whether clicking
+/// starts when TrayClick launches (click mode only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub keybind_vk: u32,
@@ -951,6 +974,9 @@ pub struct Config {
     pub mode: ClickMode,
     pub lock_position: bool,
     pub limit_clicks: u32,
+    /// The auto-stop time limit, in seconds (0 = no limit). Added in
+    /// 0.11.0; absent in older files, where it defaults to 0.
+    pub limit_seconds: u32,
     pub start_on_launch: bool,
     pub action: ClickAction,
     pub burst_clicks: u32,
@@ -1034,6 +1060,7 @@ impl Default for Config {
             mode: ClickMode::Click,
             lock_position: false,
             limit_clicks: 0,
+            limit_seconds: 0,
             start_on_launch: false,
             action: ClickAction::Single,
             burst_clicks: DEFAULT_BURST_CLICKS,
@@ -1139,7 +1166,7 @@ impl Config {
     /// Serialize as a small hand-rolled JSON object (no dependencies).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {},\n  \"target\": \"{}\",\n  \"lock_x\": {},\n  \"lock_y\": {},\n  \"lock_set\": {},\n  \"lock_rel\": {},\n  \"lock_rx\": {},\n  \"lock_ry\": {},\n  \"seq_count\": {},\n  \"seq_x1\": {},\n  \"seq_y1\": {},\n  \"seq_x2\": {},\n  \"seq_y2\": {},\n  \"seq_x3\": {},\n  \"seq_y3\": {},\n  \"seq_x4\": {},\n  \"seq_y4\": {},\n  \"slot1_x\": {},\n  \"slot1_y\": {},\n  \"slot1_set\": {},\n  \"slot1_name\": \"{}\",\n  \"slot2_x\": {},\n  \"slot2_y\": {},\n  \"slot2_set\": {},\n  \"slot2_name\": \"{}\",\n  \"slot3_x\": {},\n  \"slot3_y\": {},\n  \"slot3_set\": {},\n  \"slot3_name\": \"{}\",\n  \"offset_x\": {},\n  \"offset_y\": {},\n  \"pixel_check\": {},\n  \"pixel_set\": {},\n  \"pixel_rgb\": {},\n  \"pixel_tol\": {},\n  \"region_guard\": {},\n  \"stop_vk\": {},\n  \"hotkey_mode\": {},\n  \"fg_rule\": {},\n  \"fg_exe\": \"{}\",\n  \"fs_pause\": {}\n}}\n",
+            "{{\n  \"keybind_vk\": {},\n  \"interval_ms\": {},\n  \"button\": \"{}\",\n  \"jitter\": {},\n  \"mode\": \"{}\",\n  \"lock_position\": {},\n  \"limit_clicks\": {},\n  \"limit_seconds\": {},\n  \"start_on_launch\": {},\n  \"action\": \"{}\",\n  \"burst_clicks\": {},\n  \"burst_gap_ms\": {},\n  \"press_ms\": {},\n  \"alternate\": {},\n  \"scroll_amount\": {},\n  \"repeat_vk\": {},\n  \"drag_ax\": {},\n  \"drag_ay\": {},\n  \"drag_bx\": {},\n  \"drag_by\": {},\n  \"drag_set\": {},\n  \"random_interval\": {},\n  \"interval_max_ms\": {},\n  \"ramp\": {},\n  \"ramp_to_ms\": {},\n  \"ramp_seconds\": {},\n  \"target\": \"{}\",\n  \"lock_x\": {},\n  \"lock_y\": {},\n  \"lock_set\": {},\n  \"lock_rel\": {},\n  \"lock_rx\": {},\n  \"lock_ry\": {},\n  \"seq_count\": {},\n  \"seq_x1\": {},\n  \"seq_y1\": {},\n  \"seq_x2\": {},\n  \"seq_y2\": {},\n  \"seq_x3\": {},\n  \"seq_y3\": {},\n  \"seq_x4\": {},\n  \"seq_y4\": {},\n  \"slot1_x\": {},\n  \"slot1_y\": {},\n  \"slot1_set\": {},\n  \"slot1_name\": \"{}\",\n  \"slot2_x\": {},\n  \"slot2_y\": {},\n  \"slot2_set\": {},\n  \"slot2_name\": \"{}\",\n  \"slot3_x\": {},\n  \"slot3_y\": {},\n  \"slot3_set\": {},\n  \"slot3_name\": \"{}\",\n  \"offset_x\": {},\n  \"offset_y\": {},\n  \"pixel_check\": {},\n  \"pixel_set\": {},\n  \"pixel_rgb\": {},\n  \"pixel_tol\": {},\n  \"region_guard\": {},\n  \"stop_vk\": {},\n  \"hotkey_mode\": {},\n  \"fg_rule\": {},\n  \"fg_exe\": \"{}\",\n  \"fs_pause\": {}\n}}\n",
             self.keybind_vk,
             self.interval_ms,
             self.button.as_str(),
@@ -1147,6 +1174,7 @@ impl Config {
             self.mode.as_str(),
             self.lock_position,
             self.limit_clicks,
+            self.limit_seconds,
             self.start_on_launch,
             self.action.as_str(),
             self.burst_clicks,
@@ -1242,6 +1270,16 @@ impl Config {
         let limit_clicks = match json_u32(text, "\"limit_clicks\"") {
             Some(n) => {
                 if !is_valid_limit(n) {
+                    return None;
+                }
+                n
+            }
+            None => 0,
+        };
+        // Field added in 0.11.0; absent in older files, defaults apply.
+        let limit_seconds = match json_u32(text, "\"limit_seconds\"") {
+            Some(n) => {
+                if !is_valid_limit_seconds(n) {
                     return None;
                 }
                 n
@@ -1446,6 +1484,7 @@ impl Config {
             jitter,
             mode,
             limit_clicks,
+            limit_seconds,
             start_on_launch,
             action,
             burst_clicks,
@@ -1613,6 +1652,7 @@ mod tests {
             mode: ClickMode::Hold,
             lock_position: true,
             limit_clicks: 5_000,
+            limit_seconds: 3_600,
             start_on_launch: true,
             action: ClickAction::Burst,
             burst_clicks: 5,
@@ -2128,6 +2168,7 @@ mod tests {
         assert_eq!(cfg.mode, ClickMode::Click);
         assert!(!cfg.lock_position);
         assert_eq!(cfg.limit_clicks, 0);
+        assert_eq!(cfg.limit_seconds, 0);
         assert!(!cfg.start_on_launch);
     }
 
@@ -2141,9 +2182,35 @@ mod tests {
             Config::from_json("{\"keybind_vk\": 117, \"limit_clicks\": 100000001}"),
             None
         );
+        assert_eq!(
+            Config::from_json("{\"keybind_vk\": 117, \"limit_seconds\": 604801}"),
+            None
+        );
         assert!(is_valid_limit(0));
         assert!(is_valid_limit(MAX_LIMIT_CLICKS));
         assert!(!is_valid_limit(MAX_LIMIT_CLICKS + 1));
+        assert!(is_valid_limit_seconds(0));
+        assert!(is_valid_limit_seconds(MAX_LIMIT_SECONDS));
+        assert!(!is_valid_limit_seconds(MAX_LIMIT_SECONDS + 1));
+    }
+
+    #[test]
+    fn auto_stop_reached_truth_table() {
+        // Neither limit set: never fires, however long the run.
+        assert!(!auto_stop_reached(0, 0, 0, 0));
+        assert!(!auto_stop_reached(1_000_000, 0, 1_000_000, 0));
+        // Click limit alone.
+        assert!(!auto_stop_reached(9, 10, 0, 0));
+        assert!(auto_stop_reached(10, 10, 0, 0));
+        assert!(auto_stop_reached(11, 10, 0, 0));
+        // Time limit alone.
+        assert!(!auto_stop_reached(0, 0, 59, 60));
+        assert!(auto_stop_reached(0, 0, 60, 60));
+        assert!(auto_stop_reached(0, 0, 61, 60));
+        // Both set: whichever is reached first fires.
+        assert!(!auto_stop_reached(9, 10, 59, 60));
+        assert!(auto_stop_reached(10, 10, 59, 60));
+        assert!(auto_stop_reached(9, 10, 60, 60));
     }
 
     #[test]
