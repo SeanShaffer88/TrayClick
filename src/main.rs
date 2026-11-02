@@ -5373,20 +5373,22 @@ mod win {
         unsafe {
             WinHttpSendRequest(request, None, None, 0, 0, 0).ok()?;
             WinHttpReceiveResponse(request, std::ptr::null_mut()).ok()?;
-            // The status code is a pseudo-header: per the WinHTTP
-            // documentation it is queried with the name
-            // WINHTTP_HEADER_NAME_BY_INDEX and the index
-            // WINHTTP_NO_HEADER_INDEX — both are (pointer)-1
-            // sentinels the windows crate does not name.
+            // The status code is a pseudo-header: it is queried
+            // with no header name (NULL) and no header index
+            // (WINHTTP_NO_HEADER_INDEX, which is NULL) — passing
+            // any other pointer value here makes WinHTTP read from
+            // that address and crash inside winhttp.dll (field
+            // report 2026-11-02: 1.0.0 died at launch, exception
+            // 0xc0000005 in winhttp.dll).
             let mut status: u32 = 0;
             let mut len = std::mem::size_of::<u32>() as u32;
             WinHttpQueryHeaders(
                 request,
                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                PCWSTR(usize::MAX as *const u16),
+                PCWSTR::null(),
                 Some(&mut status as *mut u32 as *mut c_void),
                 &mut len,
-                usize::MAX as *mut u32,
+                std::ptr::null_mut(),
             )
             .ok()?;
             if status != 200 {
