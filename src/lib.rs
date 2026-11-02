@@ -1564,6 +1564,54 @@ fn opt_bool(text: &str, key: &str) -> Option<bool> {
     }
 }
 
+/// The GitHub API endpoint the launch-time update check reads: the
+/// repository's latest published release.
+pub const LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/SeanShaffer88/TrayClick/releases/latest";
+
+/// Pull the release tag and page URL out of a GitHub
+/// `releases/latest` response body: `Some((tag_name, html_url))`, or
+/// `None` when either field is missing or empty (an error body, a
+/// rate-limit page, or plain garbage — the check treats them all as
+/// "no news" and stays silent).
+pub fn parse_latest_release(text: &str) -> Option<(String, String)> {
+    let tag = json_str(text, "\"tag_name\"")?;
+    let url = json_str(text, "\"html_url\"")?;
+    if tag.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some((tag, url))
+}
+
+/// Split a dotted version into its numeric components, tolerating one
+/// leading `v` ("v1.0.0" → [1, 0, 0]). `None` when the string is empty
+/// or any component is not a plain non-negative number.
+fn version_parts(version: &str) -> Option<Vec<u64>> {
+    let v = version.strip_prefix('v').unwrap_or(version);
+    if v.is_empty() {
+        return None;
+    }
+    v.split('.').map(|part| part.parse::<u64>().ok()).collect()
+}
+
+/// Whether `latest` names a strictly newer version than `current`.
+/// Components compare numerically, a missing component counts as 0
+/// ("1.0" equals "1.0.0"), a leading `v` on either side is ignored,
+/// and an unparseable version on either side is never "newer".
+pub fn is_newer_version(current: &str, latest: &str) -> bool {
+    let (Some(cur), Some(lat)) = (version_parts(current), version_parts(latest)) else {
+        return false;
+    };
+    for i in 0..cur.len().max(lat.len()) {
+        let c = cur.get(i).copied().unwrap_or(0);
+        let l = lat.get(i).copied().unwrap_or(0);
+        if l != c {
+            return l > c;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2510,5 +2558,83 @@ mod tests {
         d.resync();
         assert!(!d.sample(false));
         assert!(d.sample(true));
+    }
+
+    #[test]
+    fn latest_release_parses_a_realistic_github_body() {
+        // Trimmed copy of the real api.github.com releases/latest
+        // shape (field order included: html_url precedes tag_name).
+        let body = r#"{
+  "url": "https://api.github.com/repos/SeanShaffer88/TrayClick/releases/190000001",
+  "assets_url": "https://api.github.com/repos/SeanShaffer88/TrayClick/releases/190000001/assets",
+  "upload_url": "https://uploads.github.com/repos/SeanShaffer88/TrayClick/releases/190000001/assets{?name,label}",
+  "html_url": "https://github.com/SeanShaffer88/TrayClick/releases/tag/v1.0.1",
+  "id": 190000001,
+  "author": { "login": "SeanShaffer88", "html_url": "https://github.com/SeanShaffer88" },
+  "node_id": "RE_kwDOVWHDBto4AAAA",
+  "tag_name": "v1.0.1",
+  "target_commitish": "main",
+  "name": "TrayClick v1.0.1",
+  "draft": false,
+  "prerelease": false,
+  "assets": []
+}"#;
+        assert_eq!(
+            parse_latest_release(body),
+            Some((
+                "v1.0.1".to_string(),
+                "https://github.com/SeanShaffer88/TrayClick/releases/tag/v1.0.1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn latest_release_rejects_garbage_and_error_bodies() {
+        assert_eq!(parse_latest_release(""), None);
+        assert_eq!(parse_latest_release("not json at all"), None);
+        assert_eq!(parse_latest_release("{}"), None);
+        // A GitHub error body (unknown repo, rate limit, ...): it has
+        // neither field, so there is nothing to offer.
+        assert_eq!(
+            parse_latest_release(
+                r#"{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}"#
+            ),
+            None
+        );
+        // One field without the other is not an offer either.
+        assert_eq!(parse_latest_release(r#"{"tag_name": "v9.9.9"}"#), None);
+        assert_eq!(
+            parse_latest_release(r#"{"html_url": "https://example.com/x"}"#),
+            None
+        );
+        assert_eq!(
+            parse_latest_release(r#"{"tag_name": "", "html_url": "https://example.com/x"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn newer_version_compares_dotted_numbers() {
+        // Equal is not newer, in either spelling.
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "v1.0.0"));
+        assert!(!is_newer_version("v1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0", "1.0.0"));
+        // Strictly newer / older.
+        assert!(is_newer_version("0.11.0", "v1.0.0"));
+        assert!(is_newer_version("v0.11.0", "1.0.0"));
+        assert!(is_newer_version("0.11.0", "0.11.1"));
+        assert!(!is_newer_version("0.11.1", "0.11.0"));
+        assert!(!is_newer_version("1.0.0", "0.99.99"));
+        assert!(is_newer_version("1.0.0", "1.0.1"));
+        assert!(is_newer_version("1.0", "1.0.1"));
+        assert!(!is_newer_version("2.0.0", "1.99.99"));
+        // Malformed input is never "newer".
+        assert!(!is_newer_version("1.0.0", "banana"));
+        assert!(!is_newer_version("1.0.0", ""));
+        assert!(!is_newer_version("1.0.0", "v"));
+        assert!(!is_newer_version("1.0.0", "1.0.x"));
+        assert!(!is_newer_version("1.0.0", "1.0.0-beta"));
+        assert!(!is_newer_version("banana", "9.9.9"));
     }
 }
