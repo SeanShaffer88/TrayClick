@@ -7,6 +7,272 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Identity and monotonic lifetime of one activation, retained through cleanup.
+#[derive(Clone, Copy, Debug)]
+pub struct ActionRun {
+    pub id: u64,
+    pub started: Instant,
+    pub deadline: Option<Instant>,
+}
+
+impl ActionRun {
+    pub fn expired(self, now: Instant) -> bool {
+        self.deadline.is_some_and(|end| now >= end)
+    }
+}
+
+/// Clock and cancellation seam; tests never need OS input or real sleeps.
+pub trait ActionClock {
+    fn now(&self) -> Instant;
+    fn allowed(&mut self, run: ActionRun) -> bool;
+    fn pause(&mut self, duration: Duration);
+}
+
+pub fn wait_for_action(clock: &mut impl ActionClock, run: ActionRun, until: Instant) -> bool {
+    loop {
+        if !clock.allowed(run) {
+            return false;
+        }
+        let now = clock.now();
+        if run.expired(now) {
+            return false;
+        }
+        if now >= until {
+            return true;
+        }
+        let end = run.deadline.map_or(until, |end| end.min(until));
+        clock.pause((end - now).min(Duration::from_millis(5)));
+    }
+}
+
+/// Adapter for one click, keystroke, or drag. Releases bypass cancellation checks.
+pub trait ActionInput: ActionClock {
+    fn press(&mut self, run: ActionRun) -> bool;
+    fn release(&mut self, run: ActionRun);
+    fn drag_step(&mut self, run: ActionRun, step: u32);
+}
+
+pub fn perform_press(
+    input: &mut impl ActionInput,
+    run: ActionRun,
+    duration: Duration,
+    drag: bool,
+) -> bool {
+    if !input.allowed(run) || run.expired(input.now()) || !input.press(run) {
+        return false;
+    }
+    if drag {
+        for step in 1..=8 {
+            if !input.allowed(run) || run.expired(input.now()) {
+                break;
+            }
+            input.drag_step(run, step);
+            let until = input.now() + Duration::from_millis(6);
+            if !wait_for_action(input, run, until) {
+                break;
+            }
+        }
+    }
+    let until = input.now() + duration;
+    wait_for_action(input, run, until);
+    input.release(run);
+    true
+}
+
+/// Captured events for one targeted press submission.
+#[derive(Clone, Copy)]
+pub struct PressBatch<T> {
+    pub target: Option<T>,
+    pub down: T,
+    pub up: T,
+    pub back: Option<T>,
+    pub complete: bool,
+    pub restore_after: bool,
+}
+
+/// Only an accepted DOWN creates release responsibility. Failed releases retain it.
+#[derive(Debug)]
+pub struct InputOwner<T> {
+    pending: Option<(u64, T)>,
+    restore: Option<(u64, T)>,
+    releasing: bool,
+}
+
+impl<T: Copy> Default for InputOwner<T> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            restore: None,
+            releasing: false,
+        }
+    }
+}
+
+impl<T: Copy> InputOwner<T> {
+    pub fn owner(&self) -> Option<u64> {
+        self.pending.or(self.restore).map(|(run, _)| run)
+    }
+
+    pub fn cleanup_owner(&self) -> Option<u64> {
+        self.releasing.then(|| self.owner()).flatten()
+    }
+
+    pub fn press(
+        &mut self,
+        run: u64,
+        down: T,
+        up: T,
+        foreign_down: bool,
+        mut send: impl FnMut(T) -> bool,
+    ) -> bool {
+        if foreign_down || self.owner().is_some() || !send(down) {
+            return false;
+        }
+        self.pending = Some((run, up));
+        true
+    }
+
+    /// Submit a checked action as one batch and retain any unmatched accepted DOWN.
+    pub fn press_batch(
+        &mut self,
+        run: u64,
+        batch: PressBatch<T>,
+        eligibility: (bool, bool),
+        mut send: impl FnMut(&[T]) -> usize,
+    ) -> usize {
+        if !eligibility.0 || eligibility.1 || self.owner().is_some() {
+            return 0;
+        }
+        let PressBatch {
+            target,
+            down,
+            up,
+            back,
+            complete,
+            restore_after,
+        } = batch;
+        let mut events = Vec::with_capacity(4);
+        if let Some(target) = target {
+            events.push(target);
+        }
+        let down_index = events.len();
+        events.push(down);
+        let up_index = complete.then_some(events.len());
+        if complete {
+            events.push(up);
+            if let Some(back) = back {
+                events.push(back);
+            }
+        }
+        let accepted = send(&events);
+        if accepted > 0
+            && (restore_after && !complete
+                || accepted <= down_index
+                || up_index.is_some() && accepted < events.len())
+        {
+            self.restore = back.map(|back| (run, back));
+        }
+        if accepted > down_index && up_index.is_none_or(|i| accepted <= i) {
+            self.pending = Some((run, up));
+        }
+        accepted
+    }
+
+    pub fn press_sampled(
+        &mut self,
+        run: u64,
+        batch: PressBatch<T>,
+        allowed: bool,
+        selected: u32,
+        mut held: impl FnMut(u32) -> bool,
+        send: impl FnMut(&[T]) -> usize,
+    ) -> usize {
+        let foreign = !mouse_clear(None, &mut held) || held(selected);
+        self.press_batch(run, batch, (allowed, foreign), send)
+    }
+
+    pub fn move_sampled(
+        &mut self,
+        owned: Option<(u64, u32)>,
+        event: T,
+        mut held: impl FnMut(u32) -> bool,
+        mut send: impl FnMut(T) -> bool,
+    ) -> bool {
+        let own_button = match owned {
+            Some((run, vk))
+                if self.pending.is_some_and(|(id, _)| id == run) && self.restore.is_none() =>
+            {
+                Some(vk)
+            }
+            Some(_) => return false,
+            None if self.owner().is_none() => None,
+            None => return false,
+        };
+        mouse_clear(own_button, &mut held) && send(event)
+    }
+
+    pub fn scroll_sampled(
+        &mut self,
+        run: u64,
+        target: Option<T>,
+        wheel: T,
+        back: Option<T>,
+        held: impl FnMut(u32) -> bool,
+        mut send: impl FnMut(&[T]) -> usize,
+    ) -> bool {
+        if self.owner().is_some() || !mouse_clear(None, held) {
+            return false;
+        }
+        let mut events = Vec::with_capacity(3);
+        events.extend(target);
+        let wheel_index = events.len();
+        events.push(wheel);
+        events.extend(back);
+        let accepted = send(&events);
+        if target.is_some() && accepted > 0 && accepted < events.len() {
+            self.restore = back.map(|event| (run, event));
+        }
+        accepted > wheel_index
+    }
+
+    pub fn release(&mut self, run: u64, send: impl FnMut(T) -> bool) -> bool {
+        self.release_sampled(run, |_| false, send)
+    }
+
+    pub fn release_sampled(
+        &mut self,
+        run: u64,
+        held: impl FnMut(u32) -> bool,
+        mut send: impl FnMut(T) -> bool,
+    ) -> bool {
+        if self.owner().is_some_and(|id| id != run) {
+            return false;
+        }
+        self.releasing = self.owner().is_some();
+        if let Some((owner, up)) = self.pending {
+            if owner != run || !send(up) {
+                return false;
+            }
+            self.pending = None;
+        }
+        if let Some((owner, back)) = self.restore {
+            if owner != run || !mouse_clear(None, held) || !send(back) {
+                return false;
+            }
+            self.restore = None;
+        }
+        self.releasing = false;
+        true
+    }
+}
+
+/// Shared production sampling seam for every cursor movement submission.
+pub fn mouse_clear(owned: Option<u32>, mut held: impl FnMut(u32) -> bool) -> bool {
+    [1, 2, 4, 5, 6]
+        .into_iter()
+        .all(|vk| Some(vk) == owned || !held(vk))
+}
+
 /// Default click interval: the mouse clicks every 100 ms while on.
 pub const DEFAULT_INTERVAL_MS: u32 = 100;
 
@@ -2636,5 +2902,857 @@ mod tests {
         assert!(!is_newer_version("1.0.0", "1.0.x"));
         assert!(!is_newer_version("1.0.0", "1.0.0-beta"));
         assert!(!is_newer_version("banana", "9.9.9"));
+    }
+}
+
+#[cfg(test)]
+mod action_deadline_tests {
+    use super::*;
+
+    struct FakeClock {
+        now: Instant,
+        active: u64,
+        cancel_at: Option<Instant>,
+        gate: bool,
+        failsafe: bool,
+        pauses: usize,
+    }
+    impl ActionClock for FakeClock {
+        fn now(&self) -> Instant {
+            self.now
+        }
+        fn allowed(&mut self, run: ActionRun) -> bool {
+            self.active == run.id
+                && self.gate
+                && !self.failsafe
+                && self.cancel_at.is_none_or(|end| self.now < end)
+        }
+        fn pause(&mut self, duration: Duration) {
+            assert!(duration <= Duration::from_millis(5));
+            self.now += duration;
+            self.pauses += 1;
+        }
+    }
+    fn fixture(limit_ms: u64) -> (ActionRun, FakeClock) {
+        let started = Instant::now();
+        (
+            ActionRun {
+                id: 1,
+                started,
+                deadline: Some(started + Duration::from_millis(limit_ms)),
+            },
+            FakeClock {
+                now: started,
+                active: 1,
+                cancel_at: None,
+                gate: true,
+                failsafe: false,
+                pauses: 0,
+            },
+        )
+    }
+    struct FakeInput<'a> {
+        clock: &'a mut FakeClock,
+        owner: &'a mut InputOwner<bool>,
+        events: &'a mut Vec<(bool, Instant)>,
+        accept: bool,
+        steps: usize,
+    }
+    impl ActionClock for FakeInput<'_> {
+        fn now(&self) -> Instant {
+            self.clock.now()
+        }
+        fn allowed(&mut self, run: ActionRun) -> bool {
+            self.clock.allowed(run)
+        }
+        fn pause(&mut self, duration: Duration) {
+            self.clock.pause(duration);
+        }
+    }
+    impl ActionInput for FakeInput<'_> {
+        fn press(&mut self, run: ActionRun) -> bool {
+            let now = self.clock.now();
+            self.owner.press(run.id, true, false, false, |event| {
+                if self.accept {
+                    self.events.push((event, now));
+                }
+                self.accept
+            })
+        }
+        fn release(&mut self, run: ActionRun) {
+            let now = self.clock.now();
+            assert!(self.owner.release(run.id, |event| {
+                self.events.push((event, now));
+                true
+            }));
+        }
+        fn drag_step(&mut self, _run: ActionRun, _step: u32) {
+            self.steps += 1;
+        }
+    }
+    fn press(
+        clock: &mut FakeClock,
+        run: ActionRun,
+        owner: &mut InputOwner<bool>,
+        events: &mut Vec<(bool, Instant)>,
+        duration: Duration,
+        accept: bool,
+    ) -> bool {
+        let mut input = FakeInput {
+            clock,
+            owner,
+            events,
+            accept,
+            steps: 0,
+        };
+        perform_press(&mut input, run, duration, false)
+    }
+
+    #[test]
+    fn exact_deadline_blocks_first_and_subsequent_down() {
+        let (run, mut clock) = fixture(10);
+        let mut owner = InputOwner::default();
+        let mut events = Vec::new();
+        clock.now = run.deadline.unwrap();
+        assert!(!press(
+            &mut clock,
+            run,
+            &mut owner,
+            &mut events,
+            Duration::ZERO,
+            true
+        ));
+        assert!(events.is_empty());
+        clock.now = run.started;
+        assert!(press(
+            &mut clock,
+            run,
+            &mut owner,
+            &mut events,
+            Duration::from_secs(1),
+            true
+        ));
+        assert!(!press(
+            &mut clock,
+            run,
+            &mut owner,
+            &mut events,
+            Duration::ZERO,
+            true
+        ));
+        assert_eq!(
+            events,
+            vec![(true, run.started), (false, run.deadline.unwrap())]
+        );
+    }
+
+    #[test]
+    fn long_press_key_and_gap_end_at_deadline() {
+        for duration in [Duration::from_millis(1000), Duration::from_secs(60)] {
+            let (run, mut clock) = fixture(17);
+            let mut owner = InputOwner::default();
+            let mut events = Vec::new();
+            assert!(press(
+                &mut clock,
+                run,
+                &mut owner,
+                &mut events,
+                duration,
+                true
+            ));
+            assert_eq!(clock.now, run.deadline.unwrap());
+            assert_eq!(
+                events.iter().map(|e| e.0).collect::<Vec<_>>(),
+                [true, false]
+            );
+            assert!(!wait_for_action(&mut clock, run, run.started + duration));
+            assert_eq!(clock.pauses, 4);
+        }
+        let (run, mut clock) = fixture(13);
+        assert!(!wait_for_action(
+            &mut clock,
+            run,
+            run.started + Duration::from_secs(1)
+        ));
+        assert_eq!(clock.now, run.deadline.unwrap());
+    }
+
+    #[test]
+    fn cancellation_gate_and_failsafe_release_without_more_downs() {
+        for reason in 0..3 {
+            let (run, mut clock) = fixture(1000);
+            let mut owner = InputOwner::default();
+            let mut events = Vec::new();
+            assert!(owner.press(run.id, true, false, false, |event| {
+                events.push(event);
+                true
+            }));
+            match reason {
+                0 => clock.cancel_at = Some(clock.now + Duration::from_millis(7)),
+                1 => clock.gate = false,
+                _ => clock.failsafe = true,
+            }
+            assert!(!wait_for_action(
+                &mut clock,
+                run,
+                run.started + Duration::from_secs(1)
+            ));
+            assert!(clock.now <= run.started + Duration::from_millis(10));
+            assert!(owner.release(run.id, |event| {
+                events.push(event);
+                true
+            }));
+            assert_eq!(events, [true, false]);
+            assert!(!press(
+                &mut clock,
+                run,
+                &mut owner,
+                &mut Vec::new(),
+                Duration::ZERO,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn drag_cancellation_stops_steps_and_releases() {
+        let (run, mut clock) = fixture(1000);
+        clock.cancel_at = Some(run.started + Duration::from_millis(7));
+        let mut owner = InputOwner::default();
+        let mut events = Vec::new();
+        let mut input = FakeInput {
+            clock: &mut clock,
+            owner: &mut owner,
+            events: &mut events,
+            accept: true,
+            steps: 0,
+        };
+        assert!(perform_press(&mut input, run, Duration::from_secs(1), true));
+        assert_eq!(input.steps, 2);
+        assert_eq!(
+            events.iter().map(|e| e.0).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert!(clock.now <= run.started + Duration::from_millis(12));
+    }
+
+    #[test]
+    fn drag_deadline_completes_owned_release_without_remaining_steps() {
+        let (run, mut clock) = fixture(13);
+        let mut owner = InputOwner::default();
+        let mut events = Vec::new();
+        let mut input = FakeInput {
+            clock: &mut clock,
+            owner: &mut owner,
+            events: &mut events,
+            accept: true,
+            steps: 0,
+        };
+        assert!(perform_press(&mut input, run, Duration::from_secs(1), true));
+        assert_eq!(input.steps, 3);
+        assert_eq!(
+            events,
+            [(true, run.started), (false, run.deadline.unwrap())]
+        );
+    }
+
+    #[test]
+    fn rejected_down_never_releases_foreign_input() {
+        let (run, mut clock) = fixture(1000);
+        let mut owner = InputOwner::default();
+        let mut events = Vec::new();
+        assert!(!press(
+            &mut clock,
+            run,
+            &mut owner,
+            &mut events,
+            Duration::ZERO,
+            false
+        ));
+        assert!(owner.release(run.id, |_| panic!("no accepted DOWN owns an UP")));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn foreign_held_input_is_neither_pressed_nor_released() {
+        let mut owner = InputOwner::default();
+        assert!(!owner.press(1, true, false, true, |_| panic!(
+            "foreign input must not be injected"
+        )));
+        assert!(owner.release(1, |_| panic!("foreign input must not be released")));
+    }
+
+    #[test]
+    fn burst_gap_cannot_start_another_click_at_the_deadline() {
+        let (run, mut clock) = fixture(13);
+        let mut owner = InputOwner::default();
+        let mut events = Vec::new();
+        assert!(press(
+            &mut clock,
+            run,
+            &mut owner,
+            &mut events,
+            Duration::ZERO,
+            true
+        ));
+        assert!(!wait_for_action(
+            &mut clock,
+            run,
+            run.started + Duration::from_secs(1)
+        ));
+        assert!(!press(
+            &mut clock,
+            run,
+            &mut owner,
+            &mut events,
+            Duration::ZERO,
+            true
+        ));
+        assert_eq!(events, [(true, run.started), (false, run.started)]);
+    }
+
+    #[test]
+    fn failed_release_and_restart_cannot_transfer_ownership() {
+        let (run, mut clock) = fixture(1000);
+        let mut owner = InputOwner::default();
+        assert!(owner.press(run.id, 10, 11, false, |_| true));
+        let mut release_attempts = Vec::new();
+        assert!(!owner.release(run.id, |event| {
+            release_attempts.push(event);
+            false
+        }));
+        clock.active = 2;
+        assert!(!wait_for_action(&mut clock, run, run.deadline.unwrap()));
+        assert!(!owner.press(2, 20, 21, false, |_| panic!("old ownership blocks restart")));
+        assert!(!owner.release(2, |_| panic!("new run must not release old input")));
+        assert!(owner.release(run.id, |event| {
+            release_attempts.push(event);
+            true
+        }));
+        assert_eq!(release_attempts, [11, 11]);
+        assert!(owner.press(2, 20, 21, false, |_| true));
+        assert!(!owner.release(run.id, |_| panic!("old run must not release new input")));
+        assert!(owner.release(2, |event| {
+            assert_eq!(event, 21);
+            true
+        }));
+    }
+}
+
+#[cfg(test)]
+mod batch_submission_tests {
+    use super::*;
+
+    fn batch(complete: bool) -> PressBatch<i32> {
+        PressBatch {
+            target: Some(10),
+            down: 20,
+            up: 30,
+            back: Some(40),
+            complete,
+            restore_after: false,
+        }
+    }
+
+    #[test]
+    fn target_batch_all_accepted_prefixes_preserve_release_and_restore() {
+        for prefix in 0..=4 {
+            let mut owner = InputOwner::default();
+            let mut batches = Vec::new();
+            let accepted = owner.press_batch(7, batch(true), (true, false), |events| {
+                batches.push(events.to_vec());
+                prefix
+            });
+            assert_eq!(batches, [vec![10, 20, 30, 40]]);
+            assert_eq!(accepted > 1, prefix >= 2);
+            assert_eq!(
+                owner.owner(),
+                if (1..=3).contains(&prefix) {
+                    Some(7)
+                } else {
+                    None
+                }
+            );
+            let mut cleanup = Vec::new();
+            assert!(owner.release(7, |event| {
+                cleanup.push(event);
+                true
+            }));
+            assert_eq!(
+                cleanup,
+                match prefix {
+                    1 | 3 => vec![40],
+                    2 => vec![30, 40],
+                    _ => vec![],
+                }
+            );
+            assert_eq!(owner.owner(), None);
+        }
+    }
+
+    #[test]
+    fn foreign_hold_rejects_target_and_drag_batches_without_any_submission() {
+        for complete in [true, false] {
+            let mut owner = InputOwner::default();
+            let mut sequence = 4;
+            let accepted = owner.press_batch(7, batch(complete), (true, true), |_| {
+                panic!("foreign input must not move or press")
+            });
+            if accepted > 1 {
+                sequence += 1;
+            }
+            assert_eq!(sequence, 4);
+            assert!(owner.release(7, |_| panic!("no foreign UP")));
+        }
+    }
+
+    #[test]
+    fn failed_up_blocks_movements_and_retains_restore_until_cleanup_succeeds() {
+        let mut owner = InputOwner::default();
+        assert_eq!(owner.press_batch(7, batch(true), (true, false), |_| 2), 2);
+        assert!(!owner.release(7, |event| {
+            assert_eq!(event, 30);
+            false
+        }));
+        for complete in [true, false] {
+            assert_eq!(
+                owner.press_batch(8, batch(complete), (true, false), |_| panic!(
+                    "pending UP must block movement"
+                )),
+                0
+            );
+        }
+        assert!(!owner.release(8, |_| panic!("wrong run cleanup")));
+        let mut cleanup = Vec::new();
+        assert!(owner.release(7, |event| {
+            cleanup.push(event);
+            true
+        }));
+        assert_eq!(cleanup, [30, 40]);
+    }
+
+    #[test]
+    fn fixed_target_failsafe_is_sampled_before_the_atomic_batch() {
+        let mut owner = InputOwner::default();
+        let mut failsafe = false;
+        let allowed = !failsafe;
+        let mut batches = 0;
+        let accepted = owner.press_batch(7, batch(true), (allowed, false), |events| {
+            batches += 1;
+            failsafe = true; // Generated target is inside the corner zone.
+            assert_eq!(events, [10, 20, 30, 40]);
+            events.len()
+        });
+        assert!(failsafe);
+        assert_eq!(batches, 1);
+        assert_eq!(accepted, 4);
+        assert_eq!(owner.owner(), None);
+        assert_eq!(
+            owner.press_batch(7, batch(true), (false, false), |_| panic!(
+                "closed gate, cancelled, or expired run"
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn rejected_drag_down_restores_cursor_without_foreign_up() {
+        let mut owner = InputOwner::default();
+        for prefix in 0..=2 {
+            assert_eq!(
+                owner.press_batch(7, batch(false), (true, false), |events| {
+                    assert_eq!(events, [10, 20]);
+                    prefix
+                }),
+                prefix
+            );
+            let mut cleanup = Vec::new();
+            assert!(owner.release(7, |event| {
+                cleanup.push(event);
+                true
+            }));
+            assert_eq!(
+                cleanup,
+                match prefix {
+                    1 => vec![40],
+                    2 => vec![30],
+                    _ => vec![],
+                }
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampled_movement_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn batch(timed: bool) -> PressBatch<i32> {
+        PressBatch {
+            target: Some(10),
+            down: 20,
+            up: 30,
+            back: Some(40),
+            complete: !timed,
+            restore_after: true,
+        }
+    }
+
+    #[test]
+    fn sampled_foreign_buttons_reject_click_drag_scroll_without_advancement() {
+        for selected in [1, 2, 4] {
+            for foreign in [1, 2, 4, 5, 6] {
+                for timed in [false, true] {
+                    let mut owner = InputOwner::default();
+                    let mut count = 0;
+                    let mut sequence = 4;
+                    let accepted = owner.press_sampled(
+                        7,
+                        batch(timed),
+                        true,
+                        selected,
+                        |vk| vk == foreign,
+                        |_| panic!("foreign hold submitted input"),
+                    );
+                    if accepted > 1 {
+                        count += 1;
+                        sequence += 1;
+                    }
+                    assert_eq!((count, sequence), (0, 4));
+                    assert!(!owner.scroll_sampled(
+                        7,
+                        Some(10),
+                        50,
+                        Some(40),
+                        |vk| vk == foreign,
+                        |_| panic!("foreign scroll")
+                    ));
+                    assert!(owner.release_sampled(7, |vk| vk == foreign, |_| panic!("foreign UP")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timed_up_retry_precedes_deferred_restore_and_blocks_scroll_and_restart() {
+        let mut owner = InputOwner::default();
+        assert_eq!(
+            owner.press_sampled(
+                7,
+                batch(true),
+                true,
+                1,
+                |_| false,
+                |events| {
+                    assert_eq!(events, [10, 20]);
+                    2
+                }
+            ),
+            2
+        );
+        let mut trace = Vec::new();
+        assert!(!owner.release_sampled(
+            7,
+            |_| false,
+            |e| {
+                trace.push(e);
+                false
+            }
+        ));
+        assert!(!owner.scroll_sampled(
+            8,
+            Some(10),
+            50,
+            Some(40),
+            |_| false,
+            |_| panic!("pending UP scroll")
+        ));
+        assert!(!owner.release_sampled(
+            7,
+            |vk| vk == 6,
+            |e| {
+                trace.push(e);
+                true
+            }
+        ));
+        assert_eq!(trace, [30, 30]);
+        assert_eq!(owner.owner(), Some(7));
+        assert_eq!(
+            owner.press_sampled(
+                8,
+                batch(false),
+                true,
+                1,
+                |_| false,
+                |_| panic!("pending restore press")
+            ),
+            0
+        );
+        assert!(!owner.release_sampled(
+            7,
+            |_| false,
+            |e| {
+                trace.push(e);
+                false
+            }
+        ));
+        assert_eq!(owner.owner(), Some(7));
+        assert!(owner.release_sampled(
+            7,
+            |_| false,
+            |e| {
+                trace.push(e);
+                true
+            }
+        ));
+        assert_eq!(trace, [30, 30, 40, 40]);
+        assert_eq!(owner.owner(), None);
+    }
+
+    #[test]
+    fn every_partial_prefix_defers_restore_under_foreign_hold() {
+        for prefix in 1..=3 {
+            for foreign in [1, 2, 4, 5, 6] {
+                let mut owner = InputOwner::default();
+                assert_eq!(
+                    owner.press_sampled(7, batch(false), true, 1, |_| false, |_| prefix),
+                    prefix
+                );
+                let mut trace = Vec::new();
+                assert!(!owner.release_sampled(
+                    7,
+                    |vk| vk == foreign,
+                    |e| {
+                        trace.push(e);
+                        true
+                    }
+                ));
+                assert_eq!(trace, if prefix == 2 { vec![30] } else { vec![] });
+                assert_eq!(owner.owner(), Some(7));
+                assert!(!owner.move_sampled(
+                    None,
+                    10,
+                    |_| false,
+                    |_| panic!("pending restoration movement")
+                ));
+                assert!(owner.release_sampled(
+                    7,
+                    |_| false,
+                    |e| {
+                        trace.push(e);
+                        true
+                    }
+                ));
+                assert_eq!(trace.last(), Some(&40));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_drag_allows_only_its_button_and_preserves_endpoint() {
+        for selected in [1, 2, 4] {
+            let mut owner = InputOwner::default();
+            let mut drag = batch(true);
+            drag.restore_after = false;
+            assert_eq!(
+                owner.press_sampled(7, drag, true, selected, |_| false, |_| 2),
+                2
+            );
+            let foreign = Cell::new(0);
+            let mut trace = Vec::new();
+            for step in 1..=8 {
+                if step == 3 {
+                    foreign.set(5);
+                } // Another button arrives during the wait.
+                let moved = owner.move_sampled(
+                    Some((7, selected)),
+                    step,
+                    |vk| vk == selected || vk == foreign.get(),
+                    |e| {
+                        trace.push(e);
+                        true
+                    },
+                );
+                assert_eq!(moved, step < 3);
+            }
+            assert!(owner.release_sampled(
+                7,
+                |vk| vk == 5,
+                |e| {
+                    trace.push(e);
+                    true
+                }
+            ));
+            assert_eq!(trace, [1, 2, 30]);
+            assert_eq!(owner.owner(), None);
+        }
+    }
+
+    #[test]
+    fn scroll_partial_restore_failure_retains_ownership() {
+        for prefix in 1..=2 {
+            let mut owner = InputOwner::default();
+            assert_eq!(
+                owner.scroll_sampled(
+                    7,
+                    Some(10),
+                    50,
+                    Some(40),
+                    |_| false,
+                    |events| {
+                        assert_eq!(events, [10, 50, 40]);
+                        prefix
+                    }
+                ),
+                prefix == 2
+            );
+            assert!(!owner.release_sampled(7, |_| false, |_| false));
+            assert_eq!(owner.owner(), Some(7));
+            assert!(!owner.scroll_sampled(
+                8,
+                Some(10),
+                50,
+                Some(40),
+                |_| false,
+                |_| panic!("pending restore scroll")
+            ));
+            assert!(owner.release_sampled(
+                7,
+                |_| false,
+                |e| {
+                    assert_eq!(e, 40);
+                    true
+                }
+            ));
+        }
+    }
+    #[test]
+    fn wait_samples_foreign_drag_hold_and_defers_timed_restoration() {
+        struct Input {
+            now: Instant,
+            start: Instant,
+            owner: InputOwner<i32>,
+            trace: Vec<i32>,
+            drag: bool,
+            foreign: bool,
+        }
+        impl ActionClock for Input {
+            fn now(&self) -> Instant {
+                self.now
+            }
+            fn allowed(&mut self, _: ActionRun) -> bool {
+                true
+            }
+            fn pause(&mut self, d: Duration) {
+                self.now += d;
+                if self.now > self.start {
+                    self.foreign = true;
+                }
+            }
+        }
+        impl ActionInput for Input {
+            fn press(&mut self, run: ActionRun) -> bool {
+                let mut batch = batch(true);
+                batch.restore_after = !self.drag;
+                self.owner.press_sampled(
+                    run.id,
+                    batch,
+                    true,
+                    1,
+                    |_| false,
+                    |events| {
+                        self.trace.extend(events);
+                        events.len()
+                    },
+                ) > 1
+            }
+            fn release(&mut self, run: ActionRun) {
+                let foreign = self.foreign;
+                self.owner.release_sampled(
+                    run.id,
+                    |vk| foreign && vk == 6,
+                    |event| {
+                        self.trace.push(event);
+                        true
+                    },
+                );
+            }
+            fn drag_step(&mut self, run: ActionRun, step: u32) {
+                let foreign = self.foreign;
+                self.owner.move_sampled(
+                    Some((run.id, 1)),
+                    100 + step as i32,
+                    |vk| vk == 1 || foreign && vk == 6,
+                    |event| {
+                        self.trace.push(event);
+                        true
+                    },
+                );
+            }
+        }
+        for drag in [false, true] {
+            let start = Instant::now();
+            let run = ActionRun {
+                id: 7,
+                started: start,
+                deadline: None,
+            };
+            let mut input = Input {
+                now: start,
+                start,
+                owner: InputOwner::default(),
+                trace: Vec::new(),
+                drag,
+                foreign: false,
+            };
+            assert!(perform_press(
+                &mut input,
+                run,
+                Duration::from_millis(10),
+                drag
+            ));
+            if drag {
+                assert_eq!(input.trace, [10, 20, 101, 30]);
+                assert_eq!(input.owner.owner(), None);
+            } else {
+                assert_eq!(input.trace, [10, 20, 30]);
+                assert_eq!(input.owner.cleanup_owner(), Some(7));
+                input.foreign = false;
+                input.release(run);
+                assert_eq!(input.trace, [10, 20, 30, 40]);
+                assert_eq!(input.owner.cleanup_owner(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn active_owned_hold_is_not_retry_cleanup_and_successful_drag_keeps_endpoint() {
+        let mut owner = InputOwner::default();
+        let mut drag = batch(true);
+        drag.restore_after = false;
+        assert_eq!(owner.press_sampled(7, drag, true, 1, |_| false, |_| 2), 2);
+        assert_eq!(owner.cleanup_owner(), None);
+        let mut trace = Vec::new();
+        for step in 1..=8 {
+            assert!(owner.move_sampled(
+                Some((7, 1)),
+                step,
+                |vk| vk == 1,
+                |e| {
+                    trace.push(e);
+                    true
+                }
+            ));
+        }
+        assert!(owner.release_sampled(
+            7,
+            |_| false,
+            |e| {
+                trace.push(e);
+                true
+            }
+        ));
+        assert_eq!(trace, [1, 2, 3, 4, 5, 6, 7, 8, 30]);
     }
 }

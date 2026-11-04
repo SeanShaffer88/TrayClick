@@ -112,11 +112,12 @@ mod win {
         is_valid_keybind, is_valid_limit, is_valid_limit_seconds, is_valid_offset,
         is_valid_pixel_tol, is_valid_press_ms, is_valid_ramp_seconds, is_valid_repeat_key,
         is_valid_scroll_amount, jittered_interval_ms, key_name, next_click_deadline,
-        other_monitor_centre, parse_cli_full, parse_latest_release, ramped_interval_ms,
-        rect_is_fullscreen, region_changed, sanitize_slot_name, CliCommand, CliOptions,
-        ClickAction, ClickButton, ClickMode, Config, ConfigChoice, Engine, KeyPressDetector,
-        KeyReleaseDetector, TargetMode, DEFAULT_PIXEL_TOL, LATEST_RELEASE_URL, MAX_INTERVAL_MS,
-        MIN_INTERVAL_MS, USAGE, VK_ESCAPE_CODE,
+        other_monitor_centre, parse_cli_full, parse_latest_release, perform_press,
+        ramped_interval_ms, rect_is_fullscreen, region_changed, sanitize_slot_name,
+        wait_for_action, ActionClock, ActionInput, ActionRun, CliCommand, CliOptions, ClickAction,
+        ClickButton, ClickMode, Config, ConfigChoice, Engine, InputOwner, KeyPressDetector,
+        KeyReleaseDetector, PressBatch, TargetMode, DEFAULT_PIXEL_TOL, LATEST_RELEASE_URL,
+        MAX_INTERVAL_MS, MIN_INTERVAL_MS, USAGE, VK_ESCAPE_CODE,
     };
 
     use windows::core::{w, PCWSTR, PWSTR};
@@ -440,7 +441,212 @@ mod win {
     /// Whether the mouse button is currently held down (hold mode).
     /// Every stop path funnels through `refresh_indicator`, which calls
     /// `sync_hold_state` — so every stop path releases the button.
-    static HELD: AtomicBool = AtomicBool::new(false);
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    static RUN_ID: AtomicU64 = AtomicU64::new(0);
+    static ACTION_RUN: Mutex<Option<ActionRun>> = Mutex::new(None);
+    fn input_owner() -> &'static Mutex<InputOwner<INPUT>> {
+        static OWNER: OnceLock<Mutex<InputOwner<INPUT>>> = OnceLock::new();
+        OWNER.get_or_init(|| Mutex::new(InputOwner::default()))
+    }
+
+    fn action_run() -> Option<ActionRun> {
+        *ACTION_RUN.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn same_run(run: ActionRun) -> bool {
+        action_run().is_some_and(|current| current.id == run.id)
+    }
+
+    fn action_allowed_locked(
+        run: ActionRun,
+        engine: &mut Engine,
+        gate: bool,
+        failsafe: bool,
+    ) -> bool {
+        if !same_run(run) || !engine.is_clicking_now() {
+            return false;
+        }
+        if run.expired(Instant::now()) || limit_reached(0) {
+            engine.clicking = false;
+            post_main(WM_APP_LIMIT);
+            return false;
+        }
+        if failsafe {
+            engine.clicking = false;
+            post_main(WM_APP_FAILSAFE);
+            return false;
+        }
+        gate
+    }
+
+    struct ActionWait;
+    impl ActionClock for ActionWait {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn allowed(&mut self, run: ActionRun) -> bool {
+            let gate = gate_should_be_open();
+            let failsafe = cursor_in_failsafe();
+            action_allowed_locked(run, &mut lock_engine(), gate, failsafe)
+        }
+        fn pause(&mut self, duration: Duration) {
+            if duration > Duration::from_millis(2) {
+                std::thread::sleep(duration - Duration::from_millis(2));
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    struct PressInput {
+        vk: u32,
+        down: INPUT,
+        up: INPUT,
+        drag: Option<((i32, i32), (i32, i32))>,
+        target: Option<(i32, i32)>,
+    }
+
+    impl ActionClock for PressInput {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn allowed(&mut self, run: ActionRun) -> bool {
+            ActionWait.allowed(run)
+        }
+        fn pause(&mut self, duration: Duration) {
+            ActionWait.pause(duration);
+        }
+    }
+
+    impl ActionInput for PressInput {
+        fn press(&mut self, run: ActionRun) -> bool {
+            press_targeted(
+                run,
+                self.vk,
+                self.down,
+                self.up,
+                self.target,
+                false,
+                self.drag.is_none(),
+            )
+        }
+        fn release(&mut self, run: ActionRun) {
+            release_owned(run.id);
+        }
+        fn drag_step(&mut self, run: ActionRun, step: u32) {
+            if let Some(((ax, ay), (bx, by))) = self.drag {
+                let i = step as i32;
+                let mut engine = lock_engine();
+                let mut owner = input_owner().lock().unwrap_or_else(|p| p.into_inner());
+                if action_allowed_locked(
+                    run,
+                    &mut engine,
+                    gate_should_be_open(),
+                    cursor_in_failsafe(),
+                ) {
+                    owner.move_sampled(
+                        Some((run.id, self.vk)),
+                        abs_move_input(ax + (bx - ax) * i / 8, ay + (by - ay) * i / 8),
+                        button_held,
+                        send_one,
+                    );
+                }
+            }
+        }
+    }
+
+    fn button_held(vk: u32) -> bool {
+        unsafe { GetAsyncKeyState(vk as i32) < 0 }
+    }
+
+    fn send_one(input: INPUT) -> bool {
+        unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 1 }
+    }
+
+    fn press_owned(run: ActionRun, vk: u32, down: INPUT, up: INPUT) -> bool {
+        press_targeted(run, vk, down, up, None, false, false)
+    }
+
+    fn press_targeted(
+        run: ActionRun,
+        vk: u32,
+        down: INPUT,
+        up: INPUT,
+        target: Option<(i32, i32)>,
+        complete: bool,
+        restore_after: bool,
+    ) -> bool {
+        let mut engine = lock_engine();
+        let mut owner = input_owner().lock().unwrap_or_else(|p| p.into_inner());
+        let gate = gate_should_be_open();
+        let failsafe = cursor_in_failsafe();
+        if !action_allowed_locked(run, &mut engine, gate, failsafe) {
+            return false;
+        }
+        let back = target
+            .and_then(|_| cursor_pos())
+            .map(|(x, y)| abs_move_input(x, y));
+        let target = target.map(|(x, y)| abs_move_input(x, y));
+        let down_index = usize::from(target.is_some());
+        let event_count =
+            down_index + 1 + usize::from(complete) * (1 + usize::from(back.is_some()));
+        let accepted = owner.press_sampled(
+            run.id,
+            PressBatch {
+                target,
+                down,
+                up,
+                back,
+                complete,
+                restore_after,
+            },
+            action_allowed_locked(run, &mut engine, gate, failsafe),
+            vk,
+            button_held,
+            |batch| unsafe { SendInput(batch, std::mem::size_of::<INPUT>() as i32) as usize },
+        );
+        if accepted > 0
+            && ((complete && accepted < event_count) || (!complete && accepted <= down_index))
+            && !owner.release_sampled(run.id, button_held, send_one)
+        {
+            eprintln!("TrayClick: owned input release failed; ownership retained");
+        }
+        accepted > down_index
+    }
+
+    fn release_owned(id: u64) -> bool {
+        let released = input_owner()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .release_sampled(id, button_held, send_one);
+        if !released {
+            eprintln!("TrayClick: owned input release failed; ownership retained");
+        } else if current_mode() == ClickMode::Hold && HELD.load(Ordering::SeqCst) == 0 {
+            // A restarted Hold run may have waited for the old action's cleanup.
+            post_main(WM_APP_GATE);
+        }
+        released
+    }
+
+    fn button_vk(button: ClickButton) -> u32 {
+        match button {
+            ClickButton::Left => 1,
+            ClickButton::Right => 2,
+            ClickButton::Middle => 4,
+        }
+    }
+
+    fn action_wait(run: ActionRun, duration: Duration) -> bool {
+        wait_for_action(&mut ActionWait, run, Instant::now() + duration)
+    }
+
+    fn count_for(run: ActionRun) {
+        let _engine = lock_engine();
+        CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        if same_run(run) {
+            RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     static MAIN_HWND: AtomicI32 = AtomicI32::new(0);
     /// The update prompt window while it is open (0 = not open), so
     /// the check can never stack a second one.
@@ -769,16 +975,6 @@ mod win {
         }
     }
 
-    /// Press (`down = true`) or release the chosen button once — the
-    /// hold mode primitives.
-    fn send_button(down: bool) {
-        let (d, u) = button_flags(current_button());
-        let inputs = [mouse_input(0, 0, if down { d } else { u })];
-        unsafe {
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        }
-    }
-
     /// The cursor's current position, if it can be read.
     fn cursor_pos() -> Option<(i32, i32)> {
         unsafe {
@@ -854,79 +1050,37 @@ mod win {
         }
     }
 
-    /// Send one physical click of `btn` — at `point` when the cycle
-    /// resolved one, else at the cursor — honouring the configured
-    /// button-down duration (`press_ms`; 0 sends down+up as one
-    /// batch, as always).
-    fn click_once(btn: ClickButton, point: Option<(i32, i32)>) {
+    /// One accepted click owns its captured release, even after cancellation.
+    fn click_once(run: ActionRun, btn: ClickButton, point: Option<(i32, i32)>) -> bool {
         let (down, up) = button_flags(btn);
         let press = PRESS_MS.load(Ordering::SeqCst);
-        if let Some((x, y)) = point {
-            click_once_at(down, up, press, x, y);
-        } else if press == 0 {
-            let inputs = [mouse_input(0, 0, down), mouse_input(0, 0, up)];
-            unsafe {
-                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        if press == 0 {
+            let accepted = press_targeted(
+                run,
+                button_vk(btn),
+                mouse_input(0, 0, down),
+                mouse_input(0, 0, up),
+                point,
+                true,
+                true,
+            );
+            if accepted {
+                count_for(run);
             }
-        } else {
-            unsafe {
-                SendInput(
-                    &[mouse_input(0, 0, down)],
-                    std::mem::size_of::<INPUT>() as i32,
-                );
-            }
-            std::thread::sleep(Duration::from_millis(press as u64));
-            unsafe {
-                SendInput(
-                    &[mouse_input(0, 0, up)],
-                    std::mem::size_of::<INPUT>() as i32,
-                );
-            }
+            return accepted;
         }
-        CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        RUN_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Click at a fixed point, then put the cursor back where the
-    /// user left it. With no press duration this is one SendInput
-    /// batch, so the pointer only leaves for the instant of the click;
-    /// with a press duration the button-down batch goes first, the
-    /// duration elapses, then the release + restore batch follows.
-    fn click_once_at(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS, press: u32, tx: i32, ty: i32) {
-        unsafe {
-            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let abs_to = |x: i32, y: i32| {
-                mouse_input(
-                    absolute_coord(x, vx, vw) as i32,
-                    absolute_coord(y, vy, vh) as i32,
-                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                )
-            };
-            let target = abs_to(tx, ty);
-            let size = std::mem::size_of::<INPUT>() as i32;
-            let mut cur = POINT::default();
-            if GetCursorPos(&mut cur).is_ok() {
-                let back = abs_to(cur.x, cur.y);
-                if press == 0 {
-                    let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up), back];
-                    SendInput(&inputs, size);
-                } else {
-                    SendInput(&[target, mouse_input(0, 0, down)], size);
-                    std::thread::sleep(Duration::from_millis(press as u64));
-                    SendInput(&[mouse_input(0, 0, up), back], size);
-                }
-            } else if press == 0 {
-                let inputs = [target, mouse_input(0, 0, down), mouse_input(0, 0, up)];
-                SendInput(&inputs, size);
-            } else {
-                SendInput(&[target, mouse_input(0, 0, down)], size);
-                std::thread::sleep(Duration::from_millis(press as u64));
-                SendInput(&[mouse_input(0, 0, up)], size);
-            }
+        let mut input = PressInput {
+            vk: button_vk(btn),
+            down: mouse_input(0, 0, down),
+            up: mouse_input(0, 0, up),
+            drag: None,
+            target: point,
+        };
+        let accepted = perform_press(&mut input, run, Duration::from_millis(press as u64), false);
+        if accepted {
+            count_for(run);
         }
+        accepted
     }
 
     /// An absolute mouse-move input to a screen point (virtual-desktop
@@ -945,35 +1099,44 @@ mod win {
         }
     }
 
-    fn count_action() {
-        CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        RUN_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// One Scroll cycle: wheel ticks at the cursor — or, when the
     /// cycle resolved a point, a dart to it, the ticks, and a dart
     /// back, in one batch (the wheel goes to the window under the
     /// pointer).
-    fn scroll_once(point: Option<(i32, i32)>) {
+    fn scroll_once(run: ActionRun, point: Option<(i32, i32)>) -> bool {
         let amt = SCROLL_AMT.load(Ordering::SeqCst);
-        let size = std::mem::size_of::<INPUT>() as i32;
-        unsafe {
-            let mut wheel = mouse_input(0, 0, MOUSEEVENTF_WHEEL);
-            wheel.Anonymous.mi.mouseData = (amt * 120) as u32; // WHEEL_DELTA per notch
-            if let Some((x, y)) = point {
-                let target = abs_move_input(x, y);
-                let mut cur = POINT::default();
-                if GetCursorPos(&mut cur).is_ok() {
-                    let back = abs_move_input(cur.x, cur.y);
-                    SendInput(&[target, wheel, back], size);
-                } else {
-                    SendInput(&[target, wheel], size);
-                }
-            } else {
-                SendInput(&[wheel], size);
-            }
+        let mut engine = lock_engine();
+        let mut owner = input_owner().lock().unwrap_or_else(|p| p.into_inner());
+        if !action_allowed_locked(
+            run,
+            &mut engine,
+            gate_should_be_open(),
+            cursor_in_failsafe(),
+        ) {
+            return false;
         }
-        count_action();
+        let mut wheel = mouse_input(0, 0, MOUSEEVENTF_WHEEL);
+        wheel.Anonymous.mi.mouseData = (amt * 120) as u32;
+        let back = point
+            .and_then(|_| cursor_pos())
+            .map(|(x, y)| abs_move_input(x, y));
+        let accepted = owner.scroll_sampled(
+            run.id,
+            point.map(|(x, y)| abs_move_input(x, y)),
+            wheel,
+            back,
+            button_held,
+            |batch| unsafe { SendInput(batch, std::mem::size_of::<INPUT>() as i32) as usize },
+        );
+        if owner.owner() == Some(run.id) {
+            owner.release_sampled(run.id, button_held, send_one);
+        }
+        drop(owner);
+        drop(engine);
+        if accepted {
+            count_for(run);
+        }
+        accepted
     }
 
     /// Convert a GDI `COLORREF` (`0x00BBGGRR`) to packed `0xRRGGBB`.
@@ -1094,9 +1257,12 @@ mod win {
 
     /// Stop clicking because the watched region changed, and tell
     /// the UI thread so it can settle the tray indicator.
-    fn trip_region() {
-        lock_engine().clicking = false;
-        post_main(WM_APP_REGION);
+    fn stop_run(run: ActionRun, message: u32) {
+        let mut engine = lock_engine();
+        if same_run(run) {
+            engine.clicking = false;
+            post_main(message);
+        }
     }
 
     fn key_input(vk: u32, up: bool) -> INPUT {
@@ -1123,48 +1289,40 @@ mod win {
 
     /// One Key cycle: press and release the repeat key, honouring the
     /// button-down duration as the key-down duration.
-    fn key_once() {
+    fn key_once(run: ActionRun) {
         let vk = REPEAT_VK.load(Ordering::SeqCst);
         let press = PRESS_MS.load(Ordering::SeqCst);
-        let size = std::mem::size_of::<INPUT>() as i32;
-        unsafe {
-            SendInput(&[key_input(vk, false)], size);
+        let mut input = PressInput {
+            vk,
+            down: key_input(vk, false),
+            up: key_input(vk, true),
+            drag: None,
+            target: None,
+        };
+        if perform_press(&mut input, run, Duration::from_millis(press as u64), false) {
+            count_for(run);
         }
-        if press > 0 {
-            std::thread::sleep(Duration::from_millis(press as u64));
-        }
-        unsafe {
-            SendInput(&[key_input(vk, true)], size);
-        }
-        count_action();
     }
 
-    /// One Drag cycle: press at point A, glide to point B over ~50 ms,
-    /// optionally pause (the button-down duration), release. Once the
-    /// button is down the drag always completes its release — stopping
-    /// mid-drag would leave the button held.
-    fn drag_once() {
-        let (down, up) = button_flags(current_button());
+    /// A cancelled drag stops moving promptly, then releases only its accepted DOWN.
+    fn drag_once(run: ActionRun) {
+        let button = current_button();
+        let (down, up) = button_flags(button);
         let ax = DRAG_AX.load(Ordering::SeqCst);
         let ay = DRAG_AY.load(Ordering::SeqCst);
         let bx = DRAG_BX.load(Ordering::SeqCst);
         let by = DRAG_BY.load(Ordering::SeqCst);
-        let size = std::mem::size_of::<INPUT>() as i32;
-        unsafe {
-            SendInput(&[abs_move_input(ax, ay), mouse_input(0, 0, down)], size);
-            for i in 1..=8 {
-                let x = ax + (bx - ax) * i / 8;
-                let y = ay + (by - ay) * i / 8;
-                SendInput(&[abs_move_input(x, y)], size);
-                std::thread::sleep(Duration::from_millis(6));
-            }
-            let press = PRESS_MS.load(Ordering::SeqCst);
-            if press > 0 {
-                std::thread::sleep(Duration::from_millis(press as u64));
-            }
-            SendInput(&[mouse_input(0, 0, up)], size);
+        let mut input = PressInput {
+            vk: button_vk(button),
+            down: mouse_input(0, 0, down),
+            up: mouse_input(0, 0, up),
+            drag: Some(((ax, ay), (bx, by))),
+            target: Some((ax, ay)),
+        };
+        let press = Duration::from_millis(PRESS_MS.load(Ordering::SeqCst) as u64);
+        if perform_press(&mut input, run, press, true) {
+            count_for(run);
         }
-        count_action();
     }
 
     /// One scheduled cycle, with the slice-3 guards applied first:
@@ -1172,21 +1330,25 @@ mod win {
     /// skip the cycle (silently — the run continues). Both apply
     /// only to the point-acting actions (clicks and scroll); Key and
     /// Drag cycles have no target pixel to watch.
-    fn run_cycle() {
+    fn run_cycle(run: ActionRun) {
+        if !ActionWait.allowed(run) {
+            return;
+        }
         let action = current_action();
         let pointed = action.is_click_action() || action == ClickAction::Scroll;
         let point = if pointed { cycle_point() } else { None };
         if pointed {
             if region_tripped(point) {
-                trip_region();
+                stop_run(run, WM_APP_REGION);
                 return;
             }
             if !pixel_allows(point) {
                 return;
             }
         }
-        perform_cycle(point);
-        if pointed && target_mode() == TargetMode::Sequence {
+        let accepted = perform_cycle(run, point);
+        let _engine = lock_engine();
+        if accepted && pointed && same_run(run) && target_mode() == TargetMode::Sequence {
             SEQ_IDX.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1197,15 +1359,23 @@ mod win {
     /// failsafe trips, or the run hits its auto-stop limit — a long
     /// burst never outlives any of them. The clicker's own limit
     /// check settles the stop afterwards.
-    fn perform_cycle(point: Option<(i32, i32)>) {
+    fn perform_cycle(run: ActionRun, point: Option<(i32, i32)>) -> bool {
         match current_action() {
-            ClickAction::Scroll => return scroll_once(point),
-            ClickAction::Key => return key_once(),
+            ClickAction::Scroll => {
+                if ActionWait.allowed(run) {
+                    return scroll_once(run, point);
+                }
+                return false;
+            }
+            ClickAction::Key => {
+                key_once(run);
+                return false;
+            }
             ClickAction::Drag => {
                 if DRAG_SET.load(Ordering::SeqCst) {
-                    drag_once();
+                    drag_once(run);
                 }
-                return;
+                return false;
             }
             _ => {}
         }
@@ -1215,30 +1385,25 @@ mod win {
             _ => BURST_CLICKS.load(Ordering::SeqCst),
         };
         let gap = Duration::from_millis(BURST_GAP_MS.load(Ordering::SeqCst) as u64);
+        let mut accepted = false;
         for i in 0..n {
-            if i > 0 {
-                std::thread::sleep(gap);
-                if !lock_engine().is_clicking_now() {
-                    return;
-                }
-                if cursor_in_failsafe() {
-                    trip_failsafe();
-                    return;
-                }
+            if i > 0 && !action_wait(run, gap) {
+                return accepted;
             }
             let btn = effective_button(
                 current_button(),
                 ALTERNATE.load(Ordering::SeqCst),
                 RUN_COUNT.load(Ordering::Relaxed),
             );
-            click_once(btn, point);
-            // Elapsed is not tracked inside a cycle; pass 0 so this
-            // mid-burst check is the click limit only. The clicker
-            // loop checks both limits after every cycle.
+            if !click_once(run, btn, point) {
+                return accepted;
+            }
+            accepted = true;
             if limit_reached(0) {
-                return;
+                return accepted;
             }
         }
+        accepted
     }
 
     /// Whether the current run has reached an auto-stop limit:
@@ -1292,6 +1457,13 @@ mod win {
     /// the per-run counters, cancel any pending delayed start, and
     /// arm the locked-target fallback point when one is needed.
     fn on_run_started() {
+        let started = Instant::now();
+        let seconds = LIMIT_SECONDS.load(Ordering::SeqCst);
+        *ACTION_RUN.lock().unwrap_or_else(|p| p.into_inner()) = Some(ActionRun {
+            id: RUN_ID.fetch_add(1, Ordering::SeqCst) + 1,
+            started,
+            deadline: (seconds != 0).then(|| started + Duration::from_secs(seconds as u64)),
+        });
         RUN_COUNT.store(0, Ordering::Relaxed);
         SEQ_IDX.store(0, Ordering::SeqCst);
         RUN_SET.store(false, Ordering::SeqCst);
@@ -1310,19 +1482,20 @@ mod win {
     /// One press of the toggle keybind (from the poll thread's
     /// message, a registered hotkey, or the CLI toggle command).
     fn handle_keybind_press(hwnd: HWND) {
-        if current_mode() == ClickMode::Momentary {
-            // Momentary never toggles off on a press; the release
-            // of the key is what stops it.
-            if !lock_engine().is_clicking_now() {
-                lock_engine().clicking = true;
-                on_run_started();
-            }
-        } else {
-            lock_engine().press_keybind();
-            if lock_engine().is_clicking_now() {
-                on_run_started();
+        {
+            let mut engine = lock_engine();
+            if current_mode() == ClickMode::Momentary {
+                if !engine.is_clicking_now() {
+                    engine.clicking = true;
+                    on_run_started();
+                }
             } else {
-                RUN_SET.store(false, Ordering::SeqCst);
+                engine.press_keybind();
+                if engine.is_clicking_now() {
+                    on_run_started();
+                } else {
+                    RUN_SET.store(false, Ordering::SeqCst);
+                }
             }
         }
         refresh_indicator(hwnd);
@@ -1338,18 +1511,13 @@ mod win {
     /// Start clicking unconditionally (CLI --start, delayed start):
     /// clears a pause as well as starting.
     fn engine_start(hwnd: HWND) {
-        let started = {
+        {
             let mut e = lock_engine();
             e.paused = false;
             if !e.clicking {
                 e.clicking = true;
-                true
-            } else {
-                false
+                on_run_started();
             }
-        };
-        if started {
-            on_run_started();
         }
         refresh_indicator(hwnd);
     }
@@ -1395,30 +1563,47 @@ mod win {
 
     /// Release the button if it is held, unconditionally.
     fn sync_hold_state_released() {
-        if HELD.swap(false, Ordering::SeqCst) {
-            send_button(false);
+        let held = HELD.load(Ordering::SeqCst);
+        if held != 0 && release_owned(held) {
+            HELD.store(0, Ordering::SeqCst);
         }
     }
 
-    /// Keep the physical button in sync with the engine: in hold mode
-    /// the button is down exactly while the engine is active. Called at
-    /// the end of `refresh_indicator`, which every state change on the
-    /// UI thread funnels through — so the keybind, Pause, the failsafe,
-    /// the limit, opening a dialog, and Exit all release a held button.
+    fn release_inputs_on_exit() {
+        lock_engine().clicking = false;
+        sync_hold_state_released();
+        let owner = input_owner()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner();
+        if let Some(id) = owner {
+            release_owned(id);
+        }
+    }
+
+    /// Hold cleanup remains on every refresh path and retains the accepted button.
     fn sync_hold_state() {
-        // Hold mode applies to the mouse-click actions only; with a
-        // Scroll, Key, or Drag action the engine simply repeats cycles.
-        let want = lock_engine().is_clicking_now()
+        let run = action_run();
+        let want = run.is_some_and(|run| ActionWait.allowed(run))
             && current_mode() == ClickMode::Hold
-            && current_action().is_click_action()
-            && GATE_OPEN.load(Ordering::SeqCst);
+            && current_action().is_click_action();
         let held = HELD.load(Ordering::SeqCst);
-        if want && !held {
-            send_button(true);
-            HELD.store(true, Ordering::SeqCst);
-        } else if !want && held {
-            send_button(false);
-            HELD.store(false, Ordering::SeqCst);
+        if held != 0 && (!want || run.is_none_or(|run| run.id != held)) {
+            sync_hold_state_released();
+        }
+        if want && HELD.load(Ordering::SeqCst) == 0 {
+            if let Some(run) = run {
+                let button = current_button();
+                let (down, up) = button_flags(button);
+                if press_owned(
+                    run,
+                    button_vk(button),
+                    mouse_input(0, 0, down),
+                    mouse_input(0, 0, up),
+                ) {
+                    HELD.store(run.id, Ordering::SeqCst);
+                }
+            }
         }
     }
 
@@ -1498,48 +1683,9 @@ mod win {
         }
     }
 
-    /// Stop clicking because the failsafe tripped, and tell the UI
-    /// thread so it can settle the tray indicator.
-    fn trip_failsafe() {
-        lock_engine().clicking = false;
-        post_main(WM_APP_FAILSAFE);
-    }
-
-    /// Wait until `deadline`, waking early if clicking stops.
-    ///
-    /// The bulk is slept in short slices; the final ~2 ms are spin-waited
-    /// because an OS sleep can overshoot by a whole timer tick (up to
-    /// ~15 ms at the default Windows resolution) — at a 1 ms interval
-    /// that overshoot would collapse the click rate. The spin runs only
-    /// while clicking, and only for the last slice of each interval.
-    fn wait_until(deadline: Instant) {
-        // The failsafe check costs a `GetCursorPos` per call — cheap in
-        // the sleep phase (iterations are milliseconds apart) but pure
-        // overhead in the spin tail, which can loop thousands of times
-        // in the last 2 ms. Throttle it to every 500 µs there: a mouse
-        // slam takes far longer than that to reach the corner, so stop
-        // latency is unchanged in practice.
-        let mut last_failsafe_check = Instant::now() - Duration::from_millis(1);
-        loop {
-            let now = Instant::now();
-            if now >= deadline || !lock_engine().is_clicking_now() {
-                return;
-            }
-            if now.duration_since(last_failsafe_check) >= Duration::from_micros(500) {
-                last_failsafe_check = now;
-                if cursor_in_failsafe() {
-                    trip_failsafe();
-                    return;
-                }
-            }
-            let remaining = deadline - now;
-            if remaining > Duration::from_millis(2) {
-                let slice = (remaining - Duration::from_millis(2)).min(Duration::from_millis(5));
-                std::thread::sleep(slice);
-            } else {
-                std::hint::spin_loop();
-            }
-        }
+    /// Scheduling uses the same bounded cancellation checks as action waits.
+    fn wait_until(run: ActionRun, deadline: Instant) {
+        wait_for_action(&mut ActionWait, run, deadline);
     }
 
     /// The foreground window's process image name (basename) and
@@ -1648,8 +1794,18 @@ mod win {
         let mut rng = XorShift(seed);
         let mut deadline: Option<Instant> = None;
         let mut run_start: Option<Instant> = None;
+        let mut observed_run = 0;
         let mut last_gate = Instant::now() - Duration::from_millis(200);
         loop {
+            if HELD.load(Ordering::SeqCst) == 0 {
+                let pending = input_owner()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .cleanup_owner();
+                if let Some(id) = pending {
+                    release_owned(id);
+                }
+            }
             // Sample the run gate (foreground-app rule + fullscreen
             // pause) at most every 100 ms, whatever the engine state,
             // so flips are noticed mid-run and mid-idle alike.
@@ -1673,6 +1829,14 @@ mod win {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
+            let Some(run) = action_run() else {
+                continue;
+            };
+            if observed_run != run.id {
+                observed_run = run.id;
+                deadline = None;
+                run_start = Some(run.started);
+            }
             if current_mode() == ClickMode::Hold && current_action().is_click_action() {
                 // Nothing to schedule — the button is simply down. Just
                 // keep watch for the failsafe, and for the auto-stop
@@ -1682,7 +1846,7 @@ mod win {
                 // held button). The click limit cannot advance here —
                 // a hold performs no clicks.
                 if cursor_in_failsafe() {
-                    trip_failsafe();
+                    stop_run(run, WM_APP_FAILSAFE);
                 }
                 deadline = None;
                 if run_start.is_none() {
@@ -1690,16 +1854,15 @@ mod win {
                 }
                 let elapsed = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                 if limit_reached(elapsed) {
-                    lock_engine().clicking = false;
-                    post_main(WM_APP_LIMIT);
+                    stop_run(run, WM_APP_LIMIT);
                     run_start = None;
                 }
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            if cursor_in_failsafe() {
-                trip_failsafe();
+            if !ActionWait.allowed(run) {
                 deadline = None;
+                std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
             match deadline {
@@ -1708,14 +1871,14 @@ mod win {
                         run_start = Some(Instant::now());
                     }
                     if GATE_OPEN.load(Ordering::SeqCst) {
-                        run_cycle();
+                        run_cycle(run);
                     }
                     deadline = Some(Instant::now() + effective_interval(&mut rng, run_start));
                 }
                 Some(d) => {
                     if Instant::now() >= d {
                         if GATE_OPEN.load(Ordering::SeqCst) {
-                            run_cycle();
+                            run_cycle(run);
                         }
                         deadline = Some(next_click_deadline(
                             d,
@@ -1723,14 +1886,13 @@ mod win {
                             Instant::now(),
                         ));
                     } else {
-                        wait_until(d);
+                        wait_until(run, d);
                     }
                 }
             }
             let elapsed = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            if limit_reached(elapsed) {
-                lock_engine().clicking = false;
-                post_main(WM_APP_LIMIT);
+            if same_run(run) && limit_reached(elapsed) {
+                stop_run(run, WM_APP_LIMIT);
                 deadline = None;
             }
         }
@@ -5796,7 +5958,7 @@ mod win {
                     ID_START_WITH_WINDOWS => set_autostart(!autostart_enabled()),
                     ID_CREDITS => show_credits(hwnd),
                     ID_EXIT => {
-                        sync_hold_state_released();
+                        release_inputs_on_exit();
                         tray_remove(hwnd);
                         let _ = DestroyWindow(hwnd);
                     }
@@ -5805,8 +5967,8 @@ mod win {
                 LRESULT(0)
             }
             WM_DESTROY => {
-                // Belt and braces: never exit with a button held down.
-                sync_hold_state_released();
+                // Finish accepted input cleanup before the worker can be terminated.
+                release_inputs_on_exit();
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -6193,6 +6355,7 @@ mod win {
         RAMP_SECONDS.store(cfg.ramp_seconds, Ordering::SeqCst);
         if cfg.start_on_launch && cfg.mode == ClickMode::Click {
             lock_engine().clicking = true;
+            on_run_started();
             if cfg.target == TargetMode::Locked && !cfg.lock_set {
                 capture_lock_point();
             }
