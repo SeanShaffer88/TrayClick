@@ -5,10 +5,10 @@
 ; published next to this installer on every release.
 
 #ifndef AppVersion
-  #define AppVersion "0.2.1"
+  #error AppVersion must be supplied explicitly
 #endif
 #ifndef TagName
-  #define TagName "v0.2.1"
+  #error TagName must be supplied explicitly
 #endif
 
 #define AppName "TrayClick"

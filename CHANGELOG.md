@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 — 2026-11-03
+
+- Stop input actions at the run deadline and preserve required button/key releases when actions are interrupted.
+- Check release gates independently and prepare candidate artifacts before creating draft releases.
+
 ## 1.0.1 — 2026-11-02
 
 - **Fixed: TrayClick closed immediately at launch.** The update check passed an invalid value to a Windows internet call when reading the reply's status, which crashed the program inside winhttp.dll before the tray icon could be used. The call now passes the documented values. Nothing else changed.
