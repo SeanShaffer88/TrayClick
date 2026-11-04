@@ -63,6 +63,45 @@ cargo test
 
 Requires a current stable Rust toolchain on Windows. The icon in `assets/icon.ico` is embedded as a Windows resource at build time; regenerate it with `python3 assets/make_icon.py` (needs Pillow).
 
+## Reusing the core
+
+The `trayclick` library in `src/lib.rs` contains state, configuration formatting,
+timing and input-ownership policies. The Windows application in `src/main.rs`
+provides input, UI, persistence and registry adapters. Keeping this cohesive core
+in one library avoids additional packages and dependency cycles.
+
+Depending on the library starts no threads and performs no input, UI, registry,
+file or network operations. The host supplies `ActionClock` and `ActionInput`;
+`perform_press` releases after an accepted press even when cancelled. Adapters
+must retain failed releases for retry (`InputOwner` provides this bookkeeping)
+and must not release input owned by someone else. The core is platform-independent;
+the application supports Windows 10+ x64. No minimum Rust version is declared.
+
+For example, after unpacking a `cargo package --offline` archive, an independent
+project can depend on that package without copying its implementation:
+
+```toml
+[dependencies]
+trayclick = { path = "../unpacked/trayclick-1.0.1" }
+```
+
+```rust
+use std::time::{Duration, Instant};
+use trayclick::ActionRun;
+
+let started = Instant::now();
+let run = ActionRun {
+    id: 1,
+    started,
+    deadline: Some(started + Duration::from_secs(1)),
+};
+assert!(run.expired(started + Duration::from_secs(1)));
+```
+
+The package includes the original TrayClick source by Sean Shaffer and its MIT
+license. Preserve the copyright and license when reusing it. Run `cargo test
+--lib --offline` for core tests; host adapters need their own integration tests.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
