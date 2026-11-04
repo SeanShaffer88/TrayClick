@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 
@@ -10,66 +11,134 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Gate
+      - name: Validate release identity
+        id: identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = cargo metadata --no-deps --format-version 1 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed: $LASTEXITCODE" }
+          $metadata = $metadata | ConvertFrom-Json
+          # --no-deps may omit resolve; select the root manifest explicitly.
+          $package = @($metadata.packages | Where-Object { $_.name -eq 'trayclick' -and $_.manifest_path -eq (Join-Path $PWD 'Cargo.toml') })
+          if ($package.Count -ne 1) { throw 'Expected one root trayclick package' }
+          $ver = $package[0].version
+          if ($ver -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $ver -cne '1.0.2') { throw 'Expected canonical package version 1.0.2' }
+          $tag = "v$ver"
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git HEAD failed: $LASTEXITCODE" }
+          if ($head -cne $env:EVENT_SHA) { throw 'HEAD differs from event commit' }
+          if ($env:EVENT_NAME -ceq 'workflow_dispatch') {
+            if ($env:EVENT_REF -cne 'refs/heads/release/audit-1.0.2') { throw 'Candidate branch mismatch' }
+          } elseif ($env:EVENT_NAME -ceq 'push') {
+            if ($env:EVENT_REF -cne "refs/tags/$tag") { throw 'Tag/version mismatch' }
+            $tagCommit = git rev-parse --verify "refs/tags/$tag^{commit}"
+            if ($LASTEXITCODE -ne 0) { throw "git tag failed: $LASTEXITCODE" }
+            if ($tagCommit -cne $head) { throw 'Tag/HEAD mismatch' }
+            # List responses distinguish an absent release from authentication/API failure.
+            $releases = gh api "repos/$env:GH_REPO/releases?per_page=100"
+            if ($LASTEXITCODE -ne 0) { throw "Release lookup failed: $LASTEXITCODE" }
+            $releases = @($releases | ConvertFrom-Json)
+            $existing = @($releases | Where-Object { $_.tag_name -ceq $tag })
+            if ($existing.Count -eq 0 -and $releases.Count -eq 100) { throw 'Release lookup exceeded bounded first page' }
+            if (@($existing | Where-Object { -not $_.draft }).Count) { throw 'Release already published' }
+          } else { throw 'Unsupported event' }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "Event: $env:EVENT_NAME; ref: $env:EVENT_REF; commit: $head; version: $ver" >> $env:GITHUB_STEP_SUMMARY
+      - name: Format
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --locked
-      - name: Build release
-        run: cargo build --release --locked
-      - name: Package installer (Inno Setup)
-        shell: pwsh
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Clippy
         run: |
-          $tag = "${{ github.ref_name }}"
-          $ver = $tag -replace '^v', ''
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          cargo clippy --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test
+        run: |
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build release
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package installer (Inno Setup)
+        env:
+          PACKAGE_VERSION: ${{ steps.identity.outputs.version }}
+          PACKAGE_TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path -LiteralPath dist) { throw 'Refusing existing output directory' }
+          New-Item -ItemType Directory -Path dist | Out-Null
           $iscc = @(
-            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-            "C:\Program Files\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $iscc) {
             choco install innosetup -y --no-progress
-            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if ($LASTEXITCODE -ne 0) { throw "Chocolatey failed: $LASTEXITCODE" }
+            $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+            if (-not (Test-Path -LiteralPath $iscc)) { throw 'ISCC unavailable after installation' }
           }
-          & $iscc "/DAppVersion=$ver" "/DTagName=$tag" installer/TrayClick.iss
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Release names follow TrayClick-v<version>-x64-* since 0.10.0.
-          Rename-Item "dist/TrayClick-Setup-$tag-x64.exe" "TrayClick-$tag-x64-Setup.exe"
-          Get-ChildItem dist | Select-Object Name, Length
+          & $iscc "/DAppVersion=$env:PACKAGE_VERSION" "/DTagName=$env:PACKAGE_TAG" installer/TrayClick.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+          Rename-Item "dist/TrayClick-Setup-$env:PACKAGE_TAG-x64.exe" "TrayClick-$env:PACKAGE_TAG-x64-Setup.exe"
       - name: Package portable zip
-        shell: pwsh
+        env:
+          PACKAGE_TAG: ${{ steps.identity.outputs.tag }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          New-Item -ItemType Directory -Force -Path "dist/portable" | Out-Null
-          Copy-Item target/release/trayclick.exe "dist/portable/"
-          Copy-Item README.md "dist/portable/"
-          Copy-Item LICENSE "dist/portable/"
-          Copy-Item PORTABLE.txt "dist/portable/"
-          Compress-Archive -Path "dist/portable/*" -DestinationPath "dist/TrayClick-$tag-x64-Portable.zip"
-          Get-ChildItem dist | Select-Object Name, Length
-      - name: Write SHA256SUMS.txt
-        shell: pwsh
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path target/release-portable | Out-Null
+          Copy-Item target/release/trayclick.exe, README.md, LICENSE, PORTABLE.txt target/release-portable/
+          Compress-Archive -Path target/release-portable/* -DestinationPath "dist/TrayClick-$env:PACKAGE_TAG-x64-Portable.zip"
+      - name: Verify delivery files and write checksums
+        env:
+          PACKAGE_TAG: ${{ steps.identity.outputs.tag }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $assets = @(
-            "TrayClick-$tag-x64-Setup.exe",
-            "TrayClick-$tag-x64-Portable.zip"
-          )
+          $ErrorActionPreference = 'Stop'
+          $assets = @("TrayClick-$env:PACKAGE_TAG-x64-Setup.exe", "TrayClick-$env:PACKAGE_TAG-x64-Portable.zip")
           $lines = foreach ($name in $assets) {
-            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLower()
+            $file = Get-Item -LiteralPath "dist/$name"
+            if ($file.PSIsContainer -or $file.Length -eq 0) { throw "Empty asset: $name" }
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $name"
           }
-          $lines | Set-Content "dist/SHA256SUMS.txt" -Encoding ascii
-          Get-Content "dist/SHA256SUMS.txt"
-      - name: Attach to release
+          $lines | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          $expected = @($assets) + 'SHA256SUMS.txt'
+          if (@(Compare-Object $expected @(Get-ChildItem dist -Force | Select-Object -ExpandProperty Name)).Count) { throw 'Unexpected delivery files' }
+      - name: Upload candidate
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayClick-v1.0.2-x64-candidate
+          if-no-files-found: error
+          path: |
+            dist/TrayClick-v1.0.2-x64-Setup.exe
+            dist/TrayClick-v1.0.2-x64-Portable.zip
+            dist/SHA256SUMS.txt
+      - name: Attach to draft release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
+          fail_on_unmatched_files: true
           files: |
-            dist/TrayClick-*-x64-Setup.exe
-            dist/TrayClick-*-x64-Portable.zip
+            dist/TrayClick-v1.0.2-x64-Setup.exe
+            dist/TrayClick-v1.0.2-x64-Portable.zip
             dist/SHA256SUMS.txt
